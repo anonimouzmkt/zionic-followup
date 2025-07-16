@@ -1,0 +1,34 @@
+{
+  "name": "zionic-followup-server",
+  "version": "1.0.0",
+  "description": "Servidor automático de follow-up para reativação de leads inativos",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node test-followup.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "axios": "^1.6.0",
+    "node-cron": "^3.0.3",
+    "dotenv": "^16.3.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "follow-up",
+    "automation",
+    "ai",
+    "whatsapp",
+    "leads",
+    "crm"
+  ],
+  "author": "Zionic",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zionic/follow-up-server"
+  }
+} 
