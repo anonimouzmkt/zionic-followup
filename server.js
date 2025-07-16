@@ -261,7 +261,21 @@ async function getCompanyOpenAIConfig(companyId) {
  */
 async function checkCreditsBalance(companyId, estimatedTokens = CONFIG.credits.estimatedTokensPerFollowUp) {
   try {
-    log('debug', 'Verificando saldo de créditos', { companyId, estimatedTokens });
+    // ✅ VALIDAÇÃO DE ENTRADA
+    if (!companyId || companyId === 'undefined' || companyId === null) {
+      log('error', 'CompanyId inválido para verificação de créditos', { 
+        companyId, 
+        type: typeof companyId,
+        estimatedTokens 
+      });
+      return { hasEnough: false, currentBalance: 0, required: estimatedTokens, error: 'CompanyId inválido' };
+    }
+    
+    log('debug', 'Verificando saldo de créditos', { 
+      companyId: companyId.toString(), 
+      estimatedTokens,
+      companyIdType: typeof companyId
+    });
     
     const { data, error } = await supabase
       .from('company_credits')
@@ -270,15 +284,19 @@ async function checkCreditsBalance(companyId, estimatedTokens = CONFIG.credits.e
       .single();
     
     if (error) {
-      log('error', 'Erro ao verificar créditos', { error: error.message, companyId });
-      return { hasEnough: false, currentBalance: 0, required: estimatedTokens };
+      log('error', 'Erro ao verificar créditos', { 
+        error: error.message, 
+        companyId: companyId.toString(),
+        errorCode: error.code
+      });
+      return { hasEnough: false, currentBalance: 0, required: estimatedTokens, error: error.message };
     }
     
     const currentBalance = data?.balance || 0;
     const hasEnough = currentBalance >= estimatedTokens;
     
     log('debug', 'Saldo verificado', { 
-      companyId, 
+      companyId: companyId.toString(), 
       currentBalance, 
       required: estimatedTokens, 
       hasEnough 
@@ -291,8 +309,12 @@ async function checkCreditsBalance(companyId, estimatedTokens = CONFIG.credits.e
     };
     
   } catch (error) {
-    log('error', 'Erro ao verificar créditos', { error: error.message, companyId });
-    return { hasEnough: false, currentBalance: 0, required: estimatedTokens };
+    log('error', 'Erro ao verificar créditos', { 
+      error: error.message, 
+      companyId: companyId ? companyId.toString() : 'null/undefined',
+      stack: error.stack
+    });
+    return { hasEnough: false, currentBalance: 0, required: estimatedTokens, error: error.message };
   }
 }
 
@@ -543,7 +565,31 @@ async function processFollowUp(followUp) {
   };
   
   try {
-    log('info', `Processando follow-up: ${followUp.rule_name}`, { followUpId: followUp.id });
+    log('info', `Processando follow-up: ${followUp.rule_name}`, { 
+      followUpId: followUp.id,
+      companyId: followUp.company_id,
+      agentId: followUp.agent_id,
+      conversationId: followUp.conversation_id
+    });
+    
+    // ✅ VERIFICAÇÃO DE SEGURANÇA: Garantir que company_id existe
+    if (!followUp.company_id) {
+      log('error', 'Follow-up sem company_id - buscando do agente', { followUpId: followUp.id });
+      
+      // Buscar company_id do agente como fallback
+      const { data: agent, error: agentError } = await supabase
+        .from('ai_agents')
+        .select('company_id')
+        .eq('id', followUp.agent_id)
+        .single();
+        
+      if (agentError || !agent?.company_id) {
+        throw new Error(`Não foi possível determinar company_id para o follow-up ${followUp.id}`);
+      }
+      
+      followUp.company_id = agent.company_id;
+      log('info', 'Company_id recuperado do agente', { companyId: followUp.company_id });
+    }
     
     // ✅ NOVO: Verificar créditos mínimos da empresa
     const creditsCheck = await checkCreditsBalance(followUp.company_id, CONFIG.credits.minimumBalanceThreshold);
