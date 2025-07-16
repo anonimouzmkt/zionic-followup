@@ -24,7 +24,7 @@
  * Frequência: A cada 1 minuto
  * 
  * @author Zionic Team
- * @version 1.4.0
+ * @version 1.5.0
  */
 
 require('dotenv').config();
@@ -148,13 +148,13 @@ function formatDuration(milliseconds) {
 // ===============================================
 
 /**
- * Busca follow-ups prontos para execução
+ * ✅ OTIMIZADO: Busca follow-ups prontos para execução com validações extras
  */
 async function getPendingFollowUps() {
   try {
     log('info', 'Buscando follow-ups pendentes...');
     
-    const { data: followUps, error } = await supabase.rpc('get_pending_follow_ups', {
+    const { data: followUps, error } = await supabase.rpc('get_pending_follow_ups_optimized', {
       p_limit: CONFIG.maxFollowUpsPerExecution
     });
     
@@ -163,7 +163,16 @@ async function getPendingFollowUps() {
       return [];
     }
     
-    log('success', `${followUps?.length || 0} follow-ups prontos para execução`);
+    const totalPending = followUps?.length || 0;
+    const overdueCount = followUps?.filter(f => f.minutes_overdue > 0).length || 0;
+    
+    log('success', `${totalPending} follow-ups prontos para execução`, {
+      total: totalPending,
+      overdue: overdueCount,
+      onTime: totalPending - overdueCount,
+      method: 'sql_optimized'
+    });
+    
     return followUps || [];
     
   } catch (error) {
@@ -795,6 +804,16 @@ async function processFollowUp(followUp) {
     // ✅ NOVO: Verificar créditos mínimos da empresa
     const creditsCheck = await checkCreditsBalance(followUp.company_id, CONFIG.credits.minimumBalanceThreshold);
     if (!creditsCheck.hasEnough) {
+      // ✅ CORREÇÃO: Marcar como failed quando créditos insuficientes
+      await supabase
+        .from('follow_up_queue')
+        .update({ 
+          status: 'failed',
+          attempts: followUp.attempts + 1,
+          execution_error: `Créditos insuficientes (${creditsCheck.currentBalance}/${CONFIG.credits.minimumBalanceThreshold})`
+        })
+        .eq('id', followUp.id);
+        
       throw new Error(`Créditos insuficientes (${creditsCheck.currentBalance}/${CONFIG.credits.minimumBalanceThreshold})`);
     }
     
@@ -986,215 +1005,81 @@ async function processFollowUp(followUp) {
 // ===============================================
 
 /**
- * Busca e cria follow-ups órfãos baseado nas regras dos agentes
+ * ✅ OTIMIZADO: Limpa follow-ups antigos usando função SQL
+ */
+async function cleanupOldFailedFollowUps() {
+  try {
+    log('debug', 'Executando limpeza automática de follow-ups antigos...');
+    
+    const { data: cleanedCount, error } = await supabase.rpc('cleanup_old_follow_ups', {
+      p_hours_old: 6
+    });
+    
+    if (error) {
+      log('warning', 'Erro ao limpar follow-ups antigos', { error: error.message });
+      return;
+    }
+    
+    if (cleanedCount && cleanedCount > 0) {
+      log('info', `🧹 Limpeza automática: ${cleanedCount} follow-ups antigos marcados como failed`, {
+        olderThan: '6 horas',
+        method: 'sql_function'
+      });
+    }
+    
+  } catch (error) {
+    log('error', 'Erro na limpeza de follow-ups antigos', { error: error.message });
+  }
+}
+
+/**
+ * ✅ OTIMIZADO: Detecta e cria follow-ups órfãos usando função SQL eficiente
  */
 async function findAndCreateOrphanedFollowUps() {
   try {
-    log('info', '🔍 Verificando conversas órfãs...');
+    log('info', '🔍 Detectando follow-ups órfãos com SQL otimizado...');
     
-    // 1. Buscar conversas com agentes ativos que podem precisar de follow-up
-    const { data: conversations, error: convError } = await supabase
-      .from('conversations')
-      .select(`
-        id,
-        ai_agent_id,
-        contact_id,
-        metadata,
-        ai_agents!inner(
-          id,
-          company_id,
-          name,
-          status,
-          follow_up_rules
-        ),
-        contacts!inner(
-          id,
-          first_name,
-          phone
-        )
-      `)
-      .eq('ai_agents.status', 'active')
-      .not('ai_agents.follow_up_rules', 'is', null)
-      .gte('updated_at', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()) // Últimos 7 dias
-      .limit(100); // Limitar para não sobrecarregar
+    // ✅ Limpeza automática antes da detecção
+    await cleanupOldFailedFollowUps();
+    
+    // ✅ NOVA ABORDAGEM: Usar função SQL otimizada
+    const { data: orphanedFollowUps, error } = await supabase.rpc('create_orphaned_follow_ups', {
+      p_limit: 1000,  // Até 1000 follow-ups órfãos por execução
+      p_days_back: 7   // Últimos 7 dias
+    });
 
-    if (convError) {
-      log('error', 'Erro ao buscar conversas para sincronização', { error: convError.message });
+    if (error) {
+      log('error', 'Erro na detecção SQL de órfãos', { error: error.message });
       return [];
     }
 
-    if (!conversations || conversations.length === 0) {
-      log('info', 'Nenhuma conversa com agente ativo encontrada');
-      return [];
-    }
-
-    log('info', `Verificando ${conversations.length} conversas com agentes ativos...`);
-
-    const orphanedFollowUps = [];
-
-    // 2. Para cada conversa, verificar se precisa de follow-ups
-    for (const conversation of conversations) {
-      try {
-        // Verificar se follow-up está pausado manualmente
-        if (conversation.metadata?.follow_up_paused === true) {
-          continue;
-        }
-
-        const agent = conversation.ai_agents;
-        const followUpRules = agent.follow_up_rules || [];
-
-        if (followUpRules.length === 0) {
-          continue;
-        }
-
-        // 3. Buscar última mensagem da conversa
-        const { data: lastMessages, error: msgError } = await supabase
-          .from('messages')
-          .select('sent_at, sent_by_ai, content')
-          .eq('conversation_id', conversation.id)
-          .order('sent_at', { ascending: false })
-          .limit(2);
-
-        if (msgError) {
-          log('warning', 'Erro ao buscar mensagens da conversa', { 
-            conversationId: conversation.id, 
-            error: msgError.message 
-          });
-          continue;
-        }
-
-        if (!lastMessages || lastMessages.length === 0) {
-          continue;
-        }
-
-        const lastMessage = lastMessages[0];
-        const lastMessageTime = new Date(lastMessage.sent_at);
-        const now = new Date();
-
-        // 4. Para cada regra ativa do agente
-        for (const rule of followUpRules) {
-          if (!rule.is_active) {
-            continue;
-          }
-
-          const delayMinutes = rule.delay_minutes || 15;
-          const ruleId = rule.id || rule.name?.replace(/\s+/g, '_').toLowerCase();
-          
-          if (!ruleId) {
-            log('warning', 'Regra sem ID válido encontrada', { 
-              agentId: agent.id, 
-              ruleName: rule.name 
-            });
-            continue;
-          }
-
-          // 5. Verificar se tempo da regra já passou
-          const minutesSinceLastMessage = (now.getTime() - lastMessageTime.getTime()) / (1000 * 60);
-          
-          if (minutesSinceLastMessage < delayMinutes) {
-            continue; // Ainda não é hora desta regra
-          }
-
-          // 6. Verificar se já existe follow-up para esta regra/conversa
-          const { data: existingFollowUp, error: existingError } = await supabase
-            .from('follow_up_queue')
-            .select('id, status')
-            .eq('conversation_id', conversation.id)
-            .eq('rule_id', ruleId)
-            .single();
-
-          if (existingError && existingError.code !== 'PGRST116') { // PGRST116 = not found
-            log('warning', 'Erro ao verificar follow-up existente', { 
-              conversationId: conversation.id,
-              ruleId: ruleId,
-              error: existingError.message 
-            });
-            continue;
-          }
-
-          if (existingFollowUp) {
-            continue; // Já existe follow-up para esta regra
-          }
-
-          // 7. Criar follow-up órfão retroativo
-          const scheduledAt = new Date(lastMessageTime.getTime() + (delayMinutes * 60 * 1000));
-          
-          log('info', `Criando follow-up órfão retroativo`, {
-            conversationId: conversation.id,
-            contactName: conversation.contacts.first_name,
-            agentName: agent.name,
-            ruleName: rule.name,
-            delayMinutes: delayMinutes,
-            minutesLate: Math.round(minutesSinceLastMessage - delayMinutes),
-            scheduledAt: scheduledAt.toISOString()
-          });
-
-          const { data: newFollowUp, error: insertError } = await supabase
-            .from('follow_up_queue')
-            .insert({
-              agent_id: agent.id,
-              conversation_id: conversation.id,
-              contact_id: conversation.contact_id,
-              company_id: agent.company_id,
-              rule_id: ruleId,
-              rule_name: rule.name || `Regra ${ruleId}`,
-              scheduled_at: scheduledAt.toISOString(),
-              last_message_at: lastMessage.sent_at,
-              message_template: rule.message_template || 'Olá {nome}! Como posso continuar ajudando você?',
-              max_attempts: rule.max_attempts || 1,
-              status: 'pending',
-              attempts: 0,
-              metadata: {
-                created_by: 'orphan_sync',
-                minutes_late: Math.round(minutesSinceLastMessage - delayMinutes),
-                sync_timestamp: now.toISOString(),
-                delay_minutes: delayMinutes
-              }
-            })
-            .select('id, rule_name, scheduled_at')
-            .single();
-
-          if (insertError) {
-            log('error', 'Erro ao criar follow-up órfão', {
-              conversationId: conversation.id,
-              ruleId: ruleId,
-              error: insertError.message
-            });
-            continue;
-          }
-
-          orphanedFollowUps.push(newFollowUp);
-          
-          log('success', `Follow-up órfão criado com sucesso`, {
-            followUpId: newFollowUp.id,
-            conversationId: conversation.id,
-            ruleName: newFollowUp.rule_name,
-            contactName: conversation.contacts.first_name
-          });
-        }
-
-        // Pequena pausa entre conversas para não sobrecarregar
-        await new Promise(resolve => setTimeout(resolve, 100));
-
-      } catch (convError) {
-        log('error', 'Erro ao processar conversa para sincronização', {
-          conversationId: conversation.id,
-          error: convError.message
-        });
-        continue;
-      }
-    }
-
-    if (orphanedFollowUps.length > 0) {
-      log('success', `✅ Sincronização concluída: ${orphanedFollowUps.length} follow-ups órfãos criados`);
-    } else {
+    if (!orphanedFollowUps || orphanedFollowUps.length === 0) {
       log('info', 'Nenhum follow-up órfão encontrado');
+      return [];
+    }
+
+    log('success', `✅ Detecção SQL concluída: ${orphanedFollowUps.length} follow-ups órfãos criados`, {
+      method: 'sql_optimized',
+      orphansCreated: orphanedFollowUps.length,
+      averageLateness: orphanedFollowUps.reduce((acc, f) => acc + (f.minutes_late || 0), 0) / orphanedFollowUps.length
+    });
+
+    // Log dos órfãos criados para debug
+    if (orphanedFollowUps.length <= 10) {
+      orphanedFollowUps.forEach(followUp => {
+        log('debug', 'Follow-up órfão criado', {
+          conversationId: followUp.conversation_id,
+          ruleName: followUp.rule_name,
+          minutesLate: followUp.minutes_late,
+          scheduledAt: followUp.scheduled_at
+        });
+      });
     }
 
     return orphanedFollowUps;
 
   } catch (error) {
-    log('error', 'Erro na sincronização de follow-ups órfãos', { error: error.message });
+    log('error', 'Erro na detecção otimizada de órfãos', { error: error.message });
     return [];
   }
 }
@@ -1291,7 +1176,7 @@ function startStatusEndpoint() {
     res.json({
       status: 'running',
       service: 'Zionic Follow-up Server',
-      version: '1.4.0', // ✅ ATUALIZADO: Sistema de notificações integrado
+      version: '1.5.0', // ✅ OTIMIZAÇÃO: Detecção SQL eficiente de órfãos
       uptime: formatDuration(Date.now() - stats.serverStartTime),
       stats: {
         ...stats,
