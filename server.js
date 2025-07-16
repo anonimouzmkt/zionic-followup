@@ -47,7 +47,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 // Configurações globais
 const CONFIG = {
   maxFollowUpsPerExecution: 50,
-  executionIntervalMinutes: 2,
+  executionIntervalMinutes: 1, // ✅ ATUALIZADO: 1 minuto para maior precisão
   openaiMaxRetries: 3,
   whatsappMaxRetries: 2,
   defaultResponseTimeoutMs: 30000,
@@ -68,6 +68,7 @@ const CONFIG = {
 let stats = {
   totalExecutions: 0,
   totalFollowUpsSent: 0,
+  totalOrphansCreated: 0, // ✅ NOVO: Contador de órfãos criados
   totalErrors: 0,
   lastExecution: null,
   serverStartTime: new Date(),
@@ -709,7 +710,225 @@ async function processFollowUp(followUp) {
 }
 
 // ===============================================
-// CORE: EXECUÇÃO PRINCIPAL
+// ✅ NOVO: SINCRONIZAÇÃO DE FOLLOW-UPS ÓRFÃOS
+// ===============================================
+
+/**
+ * Busca e cria follow-ups órfãos baseado nas regras dos agentes
+ */
+async function findAndCreateOrphanedFollowUps() {
+  try {
+    log('info', '🔍 Verificando conversas órfãs...');
+    
+    // 1. Buscar conversas com agentes ativos que podem precisar de follow-up
+    const { data: conversations, error: convError } = await supabase
+      .from('conversations')
+      .select(`
+        id,
+        ai_agent_id,
+        contact_id,
+        metadata,
+        ai_agents!inner(
+          id,
+          company_id,
+          name,
+          status,
+          follow_up_rules
+        ),
+        contacts!inner(
+          id,
+          first_name,
+          phone
+        )
+      `)
+      .eq('ai_agents.status', 'active')
+      .not('ai_agents.follow_up_rules', 'is', null)
+      .gte('updated_at', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()) // Últimos 7 dias
+      .limit(100); // Limitar para não sobrecarregar
+
+    if (convError) {
+      log('error', 'Erro ao buscar conversas para sincronização', { error: convError.message });
+      return [];
+    }
+
+    if (!conversations || conversations.length === 0) {
+      log('info', 'Nenhuma conversa com agente ativo encontrada');
+      return [];
+    }
+
+    log('info', `Verificando ${conversations.length} conversas com agentes ativos...`);
+
+    const orphanedFollowUps = [];
+
+    // 2. Para cada conversa, verificar se precisa de follow-ups
+    for (const conversation of conversations) {
+      try {
+        // Verificar se follow-up está pausado manualmente
+        if (conversation.metadata?.follow_up_paused === true) {
+          continue;
+        }
+
+        const agent = conversation.ai_agents;
+        const followUpRules = agent.follow_up_rules || [];
+
+        if (followUpRules.length === 0) {
+          continue;
+        }
+
+        // 3. Buscar última mensagem da conversa
+        const { data: lastMessages, error: msgError } = await supabase
+          .from('messages')
+          .select('sent_at, sent_by_ai, content')
+          .eq('conversation_id', conversation.id)
+          .order('sent_at', { ascending: false })
+          .limit(2);
+
+        if (msgError) {
+          log('warning', 'Erro ao buscar mensagens da conversa', { 
+            conversationId: conversation.id, 
+            error: msgError.message 
+          });
+          continue;
+        }
+
+        if (!lastMessages || lastMessages.length === 0) {
+          continue;
+        }
+
+        const lastMessage = lastMessages[0];
+        const lastMessageTime = new Date(lastMessage.sent_at);
+        const now = new Date();
+
+        // 4. Para cada regra ativa do agente
+        for (const rule of followUpRules) {
+          if (!rule.is_active) {
+            continue;
+          }
+
+          const delayMinutes = rule.delay_minutes || 15;
+          const ruleId = rule.id || rule.name?.replace(/\s+/g, '_').toLowerCase();
+          
+          if (!ruleId) {
+            log('warning', 'Regra sem ID válido encontrada', { 
+              agentId: agent.id, 
+              ruleName: rule.name 
+            });
+            continue;
+          }
+
+          // 5. Verificar se tempo da regra já passou
+          const minutesSinceLastMessage = (now.getTime() - lastMessageTime.getTime()) / (1000 * 60);
+          
+          if (minutesSinceLastMessage < delayMinutes) {
+            continue; // Ainda não é hora desta regra
+          }
+
+          // 6. Verificar se já existe follow-up para esta regra/conversa
+          const { data: existingFollowUp, error: existingError } = await supabase
+            .from('follow_up_queue')
+            .select('id, status')
+            .eq('conversation_id', conversation.id)
+            .eq('rule_id', ruleId)
+            .single();
+
+          if (existingError && existingError.code !== 'PGRST116') { // PGRST116 = not found
+            log('warning', 'Erro ao verificar follow-up existente', { 
+              conversationId: conversation.id,
+              ruleId: ruleId,
+              error: existingError.message 
+            });
+            continue;
+          }
+
+          if (existingFollowUp) {
+            continue; // Já existe follow-up para esta regra
+          }
+
+          // 7. Criar follow-up órfão retroativo
+          const scheduledAt = new Date(lastMessageTime.getTime() + (delayMinutes * 60 * 1000));
+          
+          log('info', `Criando follow-up órfão retroativo`, {
+            conversationId: conversation.id,
+            contactName: conversation.contacts.first_name,
+            agentName: agent.name,
+            ruleName: rule.name,
+            delayMinutes: delayMinutes,
+            minutesLate: Math.round(minutesSinceLastMessage - delayMinutes),
+            scheduledAt: scheduledAt.toISOString()
+          });
+
+          const { data: newFollowUp, error: insertError } = await supabase
+            .from('follow_up_queue')
+            .insert({
+              agent_id: agent.id,
+              conversation_id: conversation.id,
+              contact_id: conversation.contact_id,
+              company_id: agent.company_id,
+              rule_id: ruleId,
+              rule_name: rule.name || `Regra ${ruleId}`,
+              scheduled_at: scheduledAt.toISOString(),
+              last_message_at: lastMessage.sent_at,
+              message_template: rule.message_template || 'Olá {nome}! Como posso continuar ajudando você?',
+              max_attempts: rule.max_attempts || 1,
+              status: 'pending',
+              attempts: 0,
+              metadata: {
+                created_by: 'orphan_sync',
+                minutes_late: Math.round(minutesSinceLastMessage - delayMinutes),
+                sync_timestamp: now.toISOString(),
+                delay_minutes: delayMinutes
+              }
+            })
+            .select('id, rule_name, scheduled_at')
+            .single();
+
+          if (insertError) {
+            log('error', 'Erro ao criar follow-up órfão', {
+              conversationId: conversation.id,
+              ruleId: ruleId,
+              error: insertError.message
+            });
+            continue;
+          }
+
+          orphanedFollowUps.push(newFollowUp);
+          
+          log('success', `Follow-up órfão criado com sucesso`, {
+            followUpId: newFollowUp.id,
+            conversationId: conversation.id,
+            ruleName: newFollowUp.rule_name,
+            contactName: conversation.contacts.first_name
+          });
+        }
+
+        // Pequena pausa entre conversas para não sobrecarregar
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+      } catch (convError) {
+        log('error', 'Erro ao processar conversa para sincronização', {
+          conversationId: conversation.id,
+          error: convError.message
+        });
+        continue;
+      }
+    }
+
+    if (orphanedFollowUps.length > 0) {
+      log('success', `✅ Sincronização concluída: ${orphanedFollowUps.length} follow-ups órfãos criados`);
+    } else {
+      log('info', 'Nenhum follow-up órfão encontrado');
+    }
+
+    return orphanedFollowUps;
+
+  } catch (error) {
+    log('error', 'Erro na sincronização de follow-ups órfãos', { error: error.message });
+    return [];
+  }
+}
+
+// ===============================================
+// CORE: EXECUÇÃO PRINCIPAL (ATUALIZADA)
 // ===============================================
 
 /**
@@ -725,19 +944,25 @@ async function executeFollowUps() {
   });
   
   try {
-    // 1. Buscar follow-ups pendentes
+    // 1. Buscar follow-ups pendentes existentes
     const pendingFollowUps = await getPendingFollowUps();
     
-    if (pendingFollowUps.length === 0) {
-      log('info', 'Nenhum follow-up pendente encontrado');
+    // ✅ 2. NOVO: Buscar e criar follow-ups órfãos
+    const orphanedFollowUps = await findAndCreateOrphanedFollowUps();
+    
+    // 3. Combinar ambos os tipos
+    const allFollowUps = [...pendingFollowUps, ...orphanedFollowUps];
+    
+    if (allFollowUps.length === 0) {
+      log('info', 'Nenhum follow-up para processar');
       return;
     }
     
-    log('info', `Processando ${pendingFollowUps.length} follow-ups...`);
+    log('info', `Processando ${allFollowUps.length} follow-ups (${pendingFollowUps.length} pendentes + ${orphanedFollowUps.length} órfãos)...`);
     
-    // 2. Processar cada follow-up
+    // 4. Processar cada follow-up
     const results = [];
-    for (const followUp of pendingFollowUps) {
+    for (const followUp of allFollowUps) {
       const result = await processFollowUp(followUp);
       results.push(result);
       
@@ -745,12 +970,13 @@ async function executeFollowUps() {
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
     
-    // 3. Calcular estatísticas
+    // 5. Calcular estatísticas
     const successful = results.filter(r => r.success && !r.deferred).length;
     const deferred = results.filter(r => r.deferred).length;
     const failed = results.filter(r => !r.success).length;
     
     stats.totalFollowUpsSent += successful;
+    stats.totalOrphansCreated += orphanedFollowUps.length; // ✅ NOVO: Contar órfãos criados
     stats.successRate = stats.totalFollowUpsSent / (stats.totalFollowUpsSent + stats.totalErrors) * 100;
     stats.lastExecution = new Date();
     
@@ -761,7 +987,9 @@ async function executeFollowUps() {
     const executionTime = Date.now() - executionStart;
     
     log('success', '✅ === EXECUÇÃO CONCLUÍDA ===', {
-      totalProcessed: pendingFollowUps.length,
+      totalProcessed: allFollowUps.length,
+      pendingProcessed: pendingFollowUps.length,
+      orphansCreated: orphanedFollowUps.length,
       successful,
       deferred,
       failed,
@@ -791,11 +1019,16 @@ function startStatusEndpoint() {
     res.json({
       status: 'running',
       service: 'Zionic Follow-up Server',
-      version: '1.1.0',
+      version: '1.2.0', // ✅ ATUALIZADO: Nova versão com sincronização órfã
       uptime: formatDuration(Date.now() - stats.serverStartTime),
       stats: {
         ...stats,
-        nextExecution: 'A cada 2 minutos'
+        nextExecution: 'A cada 1 minuto (máxima precisão)'
+      },
+      features: {
+        orphanSync: true,
+        creditsControl: true,
+        intervalMinutes: CONFIG.executionIntervalMinutes
       },
       timestamp: new Date().toISOString()
     });
@@ -829,14 +1062,14 @@ async function initialize() {
     
     log('success', 'Conexão com Supabase estabelecida');
     
-    // Configurar cron job para executar a cada 2 minutos
-    cron.schedule('*/2 * * * *', () => {
+    // ✅ ATUALIZADO: Configurar cron job para executar a cada 1 minuto (maior precisão)
+    cron.schedule('*/1 * * * *', () => {
       executeFollowUps().catch(error => {
         log('error', 'Erro no cron job', { error: error.message });
       });
     });
     
-    log('success', 'Cron job configurado (a cada 2 minutos)');
+    log('success', 'Cron job configurado (a cada 1 minuto para máxima precisão)');
     
     // Iniciar API de status
     startStatusEndpoint();
