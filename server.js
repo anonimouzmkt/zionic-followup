@@ -10,12 +10,13 @@
  * - Gera mensagens personalizadas com IA
  * - Envia via WhatsApp
  * - Registra logs e métricas
+ * ✅ CONTROLE AUTOMÁTICO DE CRÉDITOS
  * 
  * Deploy: Render.com
  * Frequência: A cada 2 minutos
  * 
  * @author Zionic Team
- * @version 1.0.0
+ * @version 1.1.0
  */
 
 require('dotenv').config();
@@ -33,14 +34,15 @@ console.log('🌍 Environment:', process.env.NODE_ENV || 'development');
 
 // Configurar Supabase
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error('❌ ERRO: Variáveis de ambiente do Supabase não configuradas');
+  console.error('Necessário: SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY');
   process.exit(1);
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // Configurações globais
 const CONFIG = {
@@ -53,6 +55,12 @@ const CONFIG = {
     start: 8,  // 8h
     end: 18,   // 18h
     timezone: 'America/Sao_Paulo'
+  },
+  // ✅ NOVO: Configurações de créditos
+  credits: {
+    estimatedTokensPerFollowUp: 200, // Estimativa de tokens por follow-up
+    minimumBalanceThreshold: 1000,   // Mínimo de créditos para funcionar
+    tokensToCreditsRatio: 1          // 1 token = 1 crédito
   }
 };
 
@@ -243,10 +251,112 @@ async function getCompanyOpenAIConfig(companyId) {
   }
 }
 
+// ===============================================
+// ✅ NOVO: SISTEMA DE CRÉDITOS
+// ===============================================
+
 /**
- * Gera mensagem personalizada usando OpenAI
+ * Verifica se empresa tem créditos suficientes
  */
-async function generatePersonalizedMessage(template, context, agent, openaiConfig) {
+async function checkCreditsBalance(companyId, estimatedTokens = CONFIG.credits.estimatedTokensPerFollowUp) {
+  try {
+    log('debug', 'Verificando saldo de créditos', { companyId, estimatedTokens });
+    
+    const { data, error } = await supabase
+      .from('company_credits')
+      .select('balance')
+      .eq('company_id', companyId)
+      .single();
+    
+    if (error) {
+      log('error', 'Erro ao verificar créditos', { error: error.message, companyId });
+      return { hasEnough: false, currentBalance: 0, required: estimatedTokens };
+    }
+    
+    const currentBalance = data?.balance || 0;
+    const hasEnough = currentBalance >= estimatedTokens;
+    
+    log('debug', 'Saldo verificado', { 
+      companyId, 
+      currentBalance, 
+      required: estimatedTokens, 
+      hasEnough 
+    });
+    
+    return {
+      hasEnough,
+      currentBalance,
+      required: estimatedTokens
+    };
+    
+  } catch (error) {
+    log('error', 'Erro ao verificar créditos', { error: error.message, companyId });
+    return { hasEnough: false, currentBalance: 0, required: estimatedTokens };
+  }
+}
+
+/**
+ * Processa consumo de créditos da OpenAI
+ */
+async function processOpenAICreditsUsage(companyId, totalTokens, conversationId, agentId, description) {
+  try {
+    log('debug', 'Processando consumo de créditos OpenAI', { 
+      companyId, 
+      totalTokens, 
+      conversationId 
+    });
+    
+    const { data, error } = await supabase.rpc('consume_credits', {
+      p_company_id: companyId,
+      credits_to_consume: totalTokens, // 1:1 ratio
+      service_type: 'openai_followup',
+      feature: 'Follow-up Automático',
+      description: description,
+      user_id: null, // Sistema automático
+      tokens_used: totalTokens,
+      model_used: 'gpt-4o-mini',
+      request_id: conversationId
+    });
+    
+    if (error) {
+      log('error', 'Erro ao consumir créditos', { error: error.message, companyId });
+      return false;
+    }
+    
+    log('success', 'Créditos consumidos com sucesso', { 
+      companyId, 
+      tokensUsed: totalTokens,
+      creditsConsumed: totalTokens 
+    });
+    
+    return data === true;
+    
+  } catch (error) {
+    log('error', 'Erro ao processar créditos', { error: error.message, companyId });
+    return false;
+  }
+}
+
+/**
+ * Estima tokens baseado no texto
+ */
+function estimateTokensFromText(text) {
+  // Aproximação: 4 caracteres = 1 token
+  const charCount = text.length;
+  const estimatedTokens = Math.ceil(charCount * 0.25);
+  
+  // Margem de segurança de 20%
+  return Math.ceil(estimatedTokens * 1.2);
+}
+
+// ===============================================
+// CORE: GERAÇÃO DE MENSAGEM COM IA (ATUALIZADA)
+// ===============================================
+
+/**
+ * Gera mensagem personalizada usando OpenAI com controle de créditos
+ */
+async function generatePersonalizedMessage(template, context, agent, openaiConfig, companyId) {
   try {
     log('debug', 'Gerando mensagem personalizada com IA');
     
@@ -283,6 +393,27 @@ INSTRUÇÕES:
 
 Retorne APENAS a mensagem reescrita, sem explicações.`;
 
+    // ✅ NOVO: Estimar tokens antes da chamada
+    const estimatedTokens = estimateTokensFromText(prompt) + 100; // +100 para resposta
+    
+    // ✅ NOVO: Verificar créditos suficientes
+    const creditsCheck = await checkCreditsBalance(companyId, estimatedTokens);
+    if (!creditsCheck.hasEnough) {
+      log('warning', 'Créditos insuficientes para gerar mensagem IA', {
+        companyId,
+        currentBalance: creditsCheck.currentBalance,
+        required: creditsCheck.required
+      });
+      
+      // Fallback: usar template simples
+      return template.replace('{nome}', contactName);
+    }
+
+    log('debug', 'Fazendo chamada para OpenAI com controle de créditos', {
+      estimatedTokens,
+      currentBalance: creditsCheck.currentBalance
+    });
+
     const response = await axios.post('https://api.openai.com/v1/chat/completions', {
       model: openaiConfig.model || 'gpt-4o-mini',
       messages: [
@@ -303,20 +434,39 @@ Retorne APENAS a mensagem reescrita, sem explicações.`;
     
     if (!generatedMessage) {
       log('warning', 'IA não gerou resposta, usando template original');
-      return template;
+      return template.replace('{nome}', contactName);
+    }
+    
+    // ✅ NOVO: Processar consumo de créditos
+    const actualTokensUsed = response.data.usage?.total_tokens || estimatedTokens;
+    const creditSuccess = await processOpenAICreditsUsage(
+      companyId,
+      actualTokensUsed,
+      context.conversation.id,
+      agent.id,
+      `Follow-up "${agent.name}" - ${actualTokensUsed} tokens`
+    );
+    
+    if (!creditSuccess) {
+      log('warning', 'Falha ao registrar consumo de créditos (mensagem já gerada)');
     }
     
     log('success', 'Mensagem gerada com sucesso', { 
       originalLength: template.length,
-      generatedLength: generatedMessage.length 
+      generatedLength: generatedMessage.length,
+      tokensUsed: actualTokensUsed,
+      creditsProcessed: creditSuccess
     });
     
     return generatedMessage;
     
   } catch (error) {
     log('error', 'Erro ao gerar mensagem com IA', { error: error.message });
+    
     // Fallback para template original
-    return template.replace('{nome}', context.contact?.first_name || 'usuário');
+    const fallbackMessage = template.replace('{nome}', context.contact?.first_name || 'usuário');
+    log('info', 'Usando template fallback', { fallbackMessage });
+    return fallbackMessage;
   }
 }
 
@@ -394,6 +544,12 @@ async function processFollowUp(followUp) {
   try {
     log('info', `Processando follow-up: ${followUp.rule_name}`, { followUpId: followUp.id });
     
+    // ✅ NOVO: Verificar créditos mínimos da empresa
+    const creditsCheck = await checkCreditsBalance(followUp.company_id, CONFIG.credits.minimumBalanceThreshold);
+    if (!creditsCheck.hasEnough) {
+      throw new Error(`Créditos insuficientes (${creditsCheck.currentBalance}/${CONFIG.credits.minimumBalanceThreshold})`);
+    }
+    
     // 1. Buscar contexto da conversa
     const context = await getConversationContext(followUp.conversation_id);
     if (!context) {
@@ -436,7 +592,7 @@ async function processFollowUp(followUp) {
     // 4. Buscar configuração OpenAI
     const openaiConfig = await getCompanyOpenAIConfig(followUp.company_id);
     
-    // 5. Gerar mensagem personalizada
+    // 5. Gerar mensagem personalizada (✅ COM CONTROLE DE CRÉDITOS)
     let finalMessage = followUp.message_template;
     
     if (openaiConfig) {
@@ -444,7 +600,8 @@ async function processFollowUp(followUp) {
         followUp.message_template,
         context,
         agent,
-        openaiConfig
+        openaiConfig,
+        followUp.company_id // ✅ NOVO: Passar company_id
       );
     } else {
       // Fallback simples
@@ -634,7 +791,7 @@ function startStatusEndpoint() {
     res.json({
       status: 'running',
       service: 'Zionic Follow-up Server',
-      version: '1.0.0',
+      version: '1.1.0',
       uptime: formatDuration(Date.now() - stats.serverStartTime),
       stats: {
         ...stats,
