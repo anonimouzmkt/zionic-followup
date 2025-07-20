@@ -1005,7 +1005,6 @@ async function processFollowUp(followUp) {
     // ✅ CORRIGIDO: Usar mesmo formato do webhook para garantir compatibilidade com ChatWindow
     const messageData = {
       conversation_id: followUp.conversation_id,
-      contact_id: followUp.contact_id,
       direction: 'outbound',
       message_type: 'text',
       content: finalMessage,
@@ -1014,14 +1013,15 @@ async function processFollowUp(followUp) {
       sent_at: new Date().toISOString(),
       status: 'sent', // ✅ OBRIGATÓRIO: Campo de status para compatibilidade
       sent_by_ai: true,
-      ai_agent_id: followUp.agent_id,
       external_id: null, // ✅ Campo para compatibilidade (follow-ups não têm ID externo)
       metadata: {
         follow_up_id: followUp.id,
         rule_name: followUp.rule_name,
         is_follow_up: true,
         sent_via: 'follow_up_server',
-        instance_name: instance.name
+        instance_name: instance.name,
+        ai_agent_id: followUp.agent_id, // ✅ CORRIGIDO: Agent ID vai no metadata
+        agent_name: agent.name
       }
     };
 
