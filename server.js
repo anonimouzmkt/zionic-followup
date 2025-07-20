@@ -382,6 +382,22 @@ async function processOpenAICreditsUsage(companyId, totalTokens, conversationId,
       conversationId 
     });
     
+    // ✅ NOVO: Verificar saldo antes do consumo
+    const { data: creditsBefore, error: balanceError } = await supabase
+      .from('company_credits')
+      .select('balance')
+      .eq('company_id', companyId)
+      .single();
+    
+    if (balanceError) {
+      log('error', 'Erro ao verificar saldo antes do consumo', { error: balanceError.message, companyId });
+    } else {
+      log('debug', 'Saldo ANTES do consumo', { 
+        companyId, 
+        saldoAntes: creditsBefore?.balance || 0 
+      });
+    }
+    
     const { data, error } = await supabase.rpc('consume_credits', {
       p_company_id: companyId,
       credits_to_consume: totalTokens, // 1:1 ratio
@@ -394,21 +410,74 @@ async function processOpenAICreditsUsage(companyId, totalTokens, conversationId,
       request_id: conversationId
     });
     
+    // ✅ NOVO: Log detalhado da resposta da função
+    log('debug', 'Resposta da função consume_credits', { 
+      data, 
+      error: error?.message,
+      functionResult: data
+    });
+    
     if (error) {
-      log('error', 'Erro ao consumir créditos', { error: error.message, companyId });
+      log('error', 'Erro ao consumir créditos', { 
+        error: error.message, 
+        companyId,
+        errorCode: error.code,
+        errorDetails: error.details,
+        errorHint: error.hint
+      });
       return false;
+    }
+    
+    // ✅ NOVO: Verificar saldo depois do consumo
+    const { data: creditsAfter, error: balanceAfterError } = await supabase
+      .from('company_credits')
+      .select('balance')
+      .eq('company_id', companyId)
+      .single();
+    
+    if (balanceAfterError) {
+      log('error', 'Erro ao verificar saldo depois do consumo', { error: balanceAfterError.message, companyId });
+    } else {
+      const saldoAntes = creditsBefore?.balance || 0;
+      const saldoDepois = creditsAfter?.balance || 0;
+      const diferencaEsperada = totalTokens;
+      const diferencaReal = saldoAntes - saldoDepois;
+      
+      log('success', 'Comparação de saldos', { 
+        companyId, 
+        tokensUsed: totalTokens,
+        saldoAntes,
+        saldoDepois,
+        diferencaEsperada,
+        diferencaReal,
+        funcionouCorreto: diferencaReal === diferencaEsperada
+      });
+      
+      if (diferencaReal !== diferencaEsperada) {
+        log('error', '❌ PROBLEMA: Saldo não foi atualizado corretamente!', {
+          companyId,
+          esperado: diferencaEsperada,
+          real: diferencaReal,
+          funcionResult: data
+        });
+      }
     }
     
     log('success', 'Créditos consumidos com sucesso', { 
       companyId, 
       tokensUsed: totalTokens,
-      creditsConsumed: totalTokens 
+      creditsConsumed: totalTokens,
+      functionReturnedTrue: data === true
     });
     
     return data === true;
     
   } catch (error) {
-    log('error', 'Erro ao processar créditos', { error: error.message, companyId });
+    log('error', 'Erro ao processar créditos', { 
+      error: error.message, 
+      companyId,
+      stack: error.stack
+    });
     return false;
   }
 }
@@ -933,23 +1002,48 @@ async function processFollowUp(followUp) {
       .eq('id', followUp.id);
     
     // 9. Registrar mensagem no sistema
-    await supabase
+    // ✅ CORRIGIDO: Usar mesmo formato do webhook para garantir compatibilidade com ChatWindow
+    const messageData = {
+      conversation_id: followUp.conversation_id,
+      contact_id: followUp.contact_id,
+      direction: 'outbound',
+      message_type: 'text',
+      content: finalMessage,
+      from_number: context.contact.phone,
+      from_name: agent.name,
+      sent_at: new Date().toISOString(),
+      status: 'sent', // ✅ OBRIGATÓRIO: Campo de status para compatibilidade
+      sent_by_ai: true,
+      ai_agent_id: followUp.agent_id,
+      external_id: null, // ✅ Campo para compatibilidade (follow-ups não têm ID externo)
+      metadata: {
+        follow_up_id: followUp.id,
+        rule_name: followUp.rule_name,
+        is_follow_up: true,
+        sent_via: 'follow_up_server',
+        instance_name: instance.name
+      }
+    };
+
+    const { data: newMessage, error: messageError } = await supabase
       .from('messages')
-      .insert({
-        conversation_id: followUp.conversation_id,
-        contact_id: followUp.contact_id,
-        direction: 'outbound',
-        message_type: 'text',
-        content: finalMessage,
-        sent_at: new Date().toISOString(),
-        sent_by_ai: true,
-        ai_agent_id: followUp.agent_id,
-        metadata: {
-          follow_up_id: followUp.id,
-          rule_name: followUp.rule_name,
-          is_follow_up: true
-        }
+      .insert(messageData)
+      .select('id')
+      .single();
+
+    if (messageError) {
+      log('error', 'Erro ao registrar mensagem no banco', { 
+        error: messageError.message,
+        messageData: { ...messageData, content: messageData.content.substring(0, 50) + '...' }
       });
+      // Não falhar o follow-up por erro de log
+    } else {
+      log('success', 'Mensagem registrada no banco com sucesso', { 
+        messageId: newMessage.id,
+        isFollowUp: true,
+        agentName: agent.name
+      });
+    }
     
     executionLog.success = true;
     executionLog.response_time_ms = Date.now() - startTime;
