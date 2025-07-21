@@ -1271,8 +1271,16 @@ async function processFollowUp(followUp) {
       throw new Error(sendResult.error);
     }
     
-    // 7. Marcar como enviado
-    await supabase
+    // 7. ✅ CRÍTICO: Marcar como enviado com log detalhado
+    log('debug', 'Marcando follow-up como enviado', { 
+      followUpId: followUp.id, 
+      currentStatus: 'pending', 
+      newStatus: 'sent',
+      conversationId: followUp.conversation_id,
+      ruleId: followUp.rule_id
+    });
+    
+    const { data: updateResult, error: updateError } = await supabase
       .from('follow_up_queue')
       .update({ 
         status: 'sent',
@@ -1280,7 +1288,26 @@ async function processFollowUp(followUp) {
         executed_at: new Date().toISOString(),
         ai_generated_message: finalMessage
       })
-      .eq('id', followUp.id);
+      .eq('id', followUp.id)
+      .select('status, attempts');
+    
+    if (updateError) {
+      log('error', 'ERRO CRÍTICO: Falha ao marcar follow-up como sent', { 
+        followUpId: followUp.id,
+        error: updateError.message,
+        conversationId: followUp.conversation_id,
+        ruleId: followUp.rule_id
+      });
+      throw new Error(`Erro ao marcar como sent: ${updateError.message}`);
+    }
+    
+    log('success', 'Follow-up marcado como SENT com sucesso', { 
+      followUpId: followUp.id,
+      updateResult,
+      conversationId: followUp.conversation_id,
+      ruleId: followUp.rule_id,
+      newStatus: updateResult?.[0]?.status
+    });
     
     // 8. Registrar mensagem no sistema
     // ✅ CORRIGIDO: Usar mesmo formato do webhook para garantir compatibilidade com ChatWindow
@@ -1414,11 +1441,31 @@ async function findAndCreateOrphanedFollowUps() {
   try {
     log('info', '🔍 Detectando follow-ups órfãos com SQL otimizado...');
     
+    // ✅ DEBUG: Verificar se há follow-ups 'sent' que podem estar sendo ignorados
+    const { data: sentFollowUps, error: sentError } = await supabase
+      .from('follow_up_queue')
+      .select('conversation_id, rule_id, status, scheduled_at, executed_at')
+      .eq('status', 'sent')
+      .gte('executed_at', new Date(Date.now() - 10 * 60 * 1000).toISOString()) // últimos 10 minutos
+      .limit(10);
+    
+    if (!sentError && sentFollowUps?.length > 0) {
+      log('debug', 'Follow-ups SENT encontrados (últimos 10min)', { 
+        count: sentFollowUps.length,
+        examples: sentFollowUps.map(f => ({
+          conversationId: f.conversation_id,
+          ruleId: f.rule_id,
+          status: f.status,
+          executedAt: f.executed_at
+        }))
+      });
+    }
+    
     // ✅ Limpeza automática antes da detecção
     await cleanupOldFailedFollowUps();
     
-    // ✅ CORRIGIDO: Usar função SQL corrigida que verifica status
-    const { data: orphanedFollowUps, error } = await supabase.rpc('create_orphaned_follow_ups_fixed', {
+    // ✅ ULTRA SEGURO: Usar função SQL com verificação tripla
+    const { data: orphanedFollowUps, error } = await supabase.rpc('create_orphaned_follow_ups_ultra_safe', {
       p_limit: 1000,  // Até 1000 follow-ups órfãos por execução
       p_days_back: 7   // Últimos 7 dias
     });
@@ -1433,10 +1480,33 @@ async function findAndCreateOrphanedFollowUps() {
       return [];
     }
 
-    log('success', `✅ Detecção SQL concluída: ${orphanedFollowUps.length} follow-ups órfãos criados`, {
-      method: 'sql_optimized_fixed',
+    // ✅ DEBUG CRÍTICO: Verificar se algum órfão criado tem conflito com follow-ups 'sent'
+    for (const orphan of orphanedFollowUps.slice(0, 5)) { // Verificar apenas os primeiros 5
+      const { data: existingSent, error: checkError } = await supabase
+        .from('follow_up_queue')
+        .select('id, status, executed_at')
+        .eq('conversation_id', orphan.conversation_id)
+        .eq('rule_id', orphan.rule_id)
+        .eq('status', 'sent')
+        .order('executed_at', { ascending: false })
+        .limit(1);
+      
+      if (!checkError && existingSent?.length > 0) {
+        log('error', '🚨 PROBLEMA CRÍTICO: Órfão criado para conversa que JÁ TEM follow-up SENT!', {
+          orphanConversationId: orphan.conversation_id,
+          orphanRuleId: orphan.rule_id,
+          existingSentId: existingSent[0].id,
+          existingSentExecutedAt: existingSent[0].executed_at,
+          timeSinceSent: Date.now() - new Date(existingSent[0].executed_at).getTime()
+        });
+      }
+    }
+
+    log('success', `✅ Detecção SQL ULTRA SEGURA concluída: ${orphanedFollowUps.length} follow-ups órfãos criados`, {
+      method: 'sql_ultra_safe_triple_verification',
       orphansCreated: orphanedFollowUps.length,
-      averageLateness: orphanedFollowUps.reduce((acc, f) => acc + (f.minutes_late || 0), 0) / orphanedFollowUps.length
+      averageLateness: orphanedFollowUps.reduce((acc, f) => acc + (f.minutes_late || 0), 0) / orphanedFollowUps.length,
+      fixVersion: '3.0_ultra_safe'
     });
 
     // Log dos órfãos criados para debug
@@ -1551,7 +1621,7 @@ function startStatusEndpoint() {
     res.json({
       status: 'running',
       service: 'Zionic Follow-up Server',
-      version: '1.6.0', // ✅ CORREÇÃO CRÍTICA: Fix loop infinito de follow-ups
+      version: '1.6.1', // ✅ CORREÇÃO ULTRA ROBUSTA: Loop infinito + verificação tripla
       uptime: formatDuration(Date.now() - stats.serverStartTime),
       stats: {
         ...stats,
@@ -1568,11 +1638,12 @@ function startStatusEndpoint() {
         intervalMinutes: CONFIG.executionIntervalMinutes
       },
       fixes: {
-        v16: 'Correção crítica: loop infinito + threads persistentes + master key only',
-        duplicatePrevention: 'SQL corrigida para evitar duplicatas',
-        raceConditionFix: 'Proteção contra race conditions',
+        v161: 'ULTRA ROBUSTA: Verificação tripla para eliminar loop infinito definitivamente',
+        tripleVerification: 'NOT EXISTS para pending, sent e completed recentes',
+        robustDebugging: 'Logs detalhados para rastrear duplicatas',
         threadsConsistency: 'Threads persistentes igual webhook principal',
-        simplification: 'Removidas chaves próprias - apenas master key'
+        masterKeyOnly: 'Removidas chaves próprias - apenas master key',
+        realTimeChecks: 'Verificação de status em tempo real'
       },
       timestamp: new Date().toISOString()
     });
