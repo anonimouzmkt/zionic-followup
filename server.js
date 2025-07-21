@@ -130,7 +130,7 @@ async function isBusinessHours(companyId) {
     const timezone = await getCompanyTimezone(companyId);
     
     // ✅ Obter hora atual no timezone da empresa
-    const now = new Date();
+  const now = new Date();
     const companyTime = new Intl.DateTimeFormat('en-CA', {
       timeZone: timezone,
       hour12: false,
@@ -648,10 +648,10 @@ async function generateWithAssistantAndThread(apiKey, agent, template, context, 
     // 5. Processar consumo de créditos (se tiver usage)
     if (runResult.usage?.total_tokens) {
       await processOpenAICreditsUsage(
-        companyId,
+      companyId,
         runResult.usage.total_tokens,
-        context.conversation.id,
-        agent.id,
+      context.conversation.id,
+      agent.id,
         `Follow-up Assistant "${agent.name}" - ${runResult.usage.total_tokens} tokens`
       );
     }
@@ -723,12 +723,12 @@ async function generateWithThreadOnly(apiKey, agent, template, context, companyI
  * ✅ NOVO: Constrói prompt específico para follow-up
  */
 function buildFollowUpPrompt(template, context, agent) {
-  const contactName = context.contact?.first_name || 'usuário';
-  const lastMessages = context.recentMessages
+    const contactName = context.contact?.first_name || 'usuário';
+    const lastMessages = context.recentMessages
     .slice(-3) // Últimas 3 mensagens (thread já tem o histórico)
-    .map(m => `${m.sent_by_ai ? 'Agente' : contactName}: ${m.content}`)
-    .join('\n');
-  
+      .map(m => `${m.sent_by_ai ? 'Agente' : contactName}: ${m.content}`)
+      .join('\n');
+    
   return `FOLLOW-UP AUTOMÁTICO: Você precisa reativar esta conversa que parou de responder.
 
 TEMPLATE ORIGINAL: "${template}"
@@ -1333,19 +1333,19 @@ async function processFollowUp(followUp) {
     let finalMessage = followUp.message_template;
     
     log('info', 'Usando master key OpenAI para follow-up', { 
-      companyId: followUp.company_id,
+        companyId: followUp.company_id,
       agentName: agent.name
-    });
-    
-    finalMessage = await generatePersonalizedMessageWithZionicCredits(
-      followUp.message_template,
-      context,
-      agent,
-      followUp.company_id
-    );
-    
+      });
+      
+      finalMessage = await generatePersonalizedMessageWithZionicCredits(
+        followUp.message_template,
+        context,
+        agent,
+        followUp.company_id
+      );
+      
     // ✅ Log de sucesso se personalizou (não é só replace)
-    if (finalMessage && finalMessage !== followUp.message_template.replace('{nome}', context.contact?.first_name || 'usuário')) {
+      if (finalMessage && finalMessage !== followUp.message_template.replace('{nome}', context.contact?.first_name || 'usuário')) {
       log('debug', 'Follow-up personalizado com sucesso via master key + threads');
     }
     
@@ -1724,7 +1724,7 @@ function startStatusEndpoint() {
     res.json({
       status: 'running',
       service: 'Zionic Follow-up Server',
-      version: '1.6.2', // ✅ CORREÇÃO TIMEZONE: Horário comercial baseado no timezone da empresa
+      version: '1.6.3', // ✅ CORREÇÃO DEFINITIVA: Loop infinito por trigger corrigido
       uptime: formatDuration(Date.now() - stats.serverStartTime),
       stats: {
         ...stats,
@@ -1741,13 +1741,13 @@ function startStatusEndpoint() {
         intervalMinutes: CONFIG.executionIntervalMinutes
       },
       fixes: {
-        v162: 'CORREÇÃO TIMEZONE: Horário comercial baseado no timezone da empresa/usuário',
-        timezoneDetection: 'Busca timezone da empresa ou usuário owner automaticamente',
-        businessHoursCorrect: 'Cálculo correto de horário comercial por timezone',
-        tripleVerification: 'NOT EXISTS para pending, sent e completed recentes',
+        v163: 'CORREÇÃO DEFINITIVA: Loop infinito causado pelo trigger de follow-up',
+        triggerLoopFix: 'Trigger ignora mensagens enviadas pelo follow-up server',
+        metadataExclusion: 'Mensagens com is_follow_up=true são ignoradas pelo trigger',
+        autoCleanup: 'Limpeza automática de follow-ups duplicados/órfãos',
+        timezoneCorrect: 'Horário comercial baseado no timezone da empresa',
         threadsConsistency: 'Threads persistentes igual webhook principal',
-        masterKeyOnly: 'Removidas chaves próprias - apenas master key',
-        realTimeChecks: 'Verificação de status em tempo real'
+        masterKeyOnly: 'Removidas chaves próprias - apenas master key'
       },
       timestamp: new Date().toISOString()
     });
