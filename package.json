@@ -1,6 +1,6 @@
 {
   "name": "zionic-followup-server",
-  "version": "1.6.0",
+  "version": "1.6.2",
   "description": "Servidor automático de follow-up para reativação de leads inativos",
   "main": "server.js",
   "scripts": {
