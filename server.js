@@ -249,61 +249,7 @@ async function getConversationContext(conversationId) {
 // CORE: GERAÇÃO DE MENSAGEM COM IA
 // ===============================================
 
-/**
- * Busca configurações da OpenAI da empresa
- * ✅ Verifica se OpenAI está habilitado E se tem chave configurada
- */
-async function getCompanyOpenAIConfig(companyId) {
-  try {
-    log('debug', 'Verificando configuração OpenAI da empresa', { companyId });
-    
-    const { data: settings, error } = await supabase
-      .from('company_settings')
-      .select('api_integrations')
-      .eq('company_id', companyId)
-      .single();
-      
-    if (error || !settings?.api_integrations) {
-      log('debug', 'Empresa sem configurações de API', { companyId, error: error?.message });
-      return null;
-    }
-    
-    const apiConfig = typeof settings.api_integrations === 'string'
-      ? JSON.parse(settings.api_integrations)
-      : settings.api_integrations;
-    
-    const openaiConfig = apiConfig?.openai;
-    
-    // ✅ Verificar se OpenAI está habilitado E tem chave configurada
-    const isEnabled = openaiConfig?.enabled === true;
-    const hasApiKey = openaiConfig?.api_key && openaiConfig.api_key.trim().length > 0;
-    
-    log('debug', 'Status da configuração OpenAI', {
-      companyId,
-      isEnabled,
-      hasApiKey: !!hasApiKey,
-      model: openaiConfig?.model || 'não configurado'
-    });
-    
-    if (isEnabled && hasApiKey) {
-      log('info', 'Empresa tem OpenAI próprio configurado e habilitado', { 
-        companyId,
-        model: openaiConfig.model || 'gpt-4o-mini'
-      });
-      return openaiConfig;
-    }
-    
-    log('info', 'Empresa não tem OpenAI próprio válido', { 
-      companyId,
-      reason: !isEnabled ? 'não habilitado' : 'sem chave configurada'
-    });
-    return null;
-      
-  } catch (error) {
-    log('error', 'Erro ao buscar config OpenAI', { error: error.message, companyId });
-    return null;
-  }
-}
+
 
 // ===============================================
 // ✅ NOVO: SISTEMA DE CRÉDITOS
@@ -499,259 +445,574 @@ function estimateTokensFromText(text) {
 // ===============================================
 
 /**
- * ✅ NOVO: Gera mensagem usando Zionic Credits (sem chave própria)
+ * ✅ CORRIGIDO: Gera mensagem usando Zionic Credits com THREADS PERSISTENTES
  */
 async function generatePersonalizedMessageWithZionicCredits(template, context, agent, companyId) {
   try {
-    log('info', 'Gerando mensagem com Zionic Credits (fallback inteligente)', { companyId });
+    log('info', 'Gerando mensagem com Zionic Credits usando threads persistentes', { companyId });
     
-    const contactName = context.contact?.first_name || 'usuário';
-    const lastMessages = context.recentMessages
-      .slice(-5) // Últimas 5 mensagens
-      .map(m => `${m.sent_by_ai ? 'Agente' : contactName}: ${m.content}`)
-      .join('\n');
-    
-    const prompt = `
-Você é um assistente de follow-up inteligente. Sua tarefa é reescrever uma mensagem template para reativar uma conversa, baseado no contexto específico da conversa.
-
-AGENTE: ${agent.name}
-TOM: ${agent.tone || 'profissional'}
-IDIOMA: ${agent.language || 'pt-BR'}
-
-TEMPLATE ORIGINAL:
-${template}
-
-CONTEXTO DA CONVERSA:
-- Nome do contato: ${contactName}
-- Última mensagem enviada: ${formatDuration(Date.now() - new Date(context.lastMessage?.sent_at || Date.now()).getTime())} atrás
-- Total de mensagens: ${context.messageCount}
-- Conversa prévia (últimas mensagens):
-${lastMessages}
-
-INSTRUÇÕES:
-1. Reescreva o template para ser mais específico e contextual
-2. Mencione algo específico da conversa anterior se relevante
-3. Mantenha o tom ${agent.tone || 'profissional'} e ${agent.language || 'português brasileiro'}
-4. Seja natural, não robótico
-5. Máximo 200 caracteres
-6. Não use emojis excessivos
-
-Retorne APENAS a mensagem reescrita, sem explicações.`;
-
-    // Estimar tokens necessários
-    const estimatedTokens = estimateTokensFromText(prompt) + 100; // +100 para resposta
-    
-    // Verificar créditos Zionic suficientes
-    const creditsCheck = await checkCreditsBalance(companyId, estimatedTokens);
-    if (!creditsCheck.hasEnough) {
-      log('warning', 'Créditos Zionic insuficientes para gerar mensagem IA', {
-        companyId,
-        currentBalance: creditsCheck.currentBalance,
-        required: creditsCheck.required
-      });
-      
-      // ✅ NOVO: Criar notificação de créditos insuficientes
-      await notifyZionicCreditsInsufficient(companyId, creditsCheck.currentBalance, creditsCheck.required);
-      
-      // Último fallback: usar template simples
-      return template.replace('{nome}', contactName);
-    }
-
-    log('debug', 'Fazendo chamada para OpenAI usando Zionic Credits', {
-      estimatedTokens,
-      currentBalance: creditsCheck.currentBalance,
-      companyId
-    });
-
     // ✅ USAR CHAVE ZIONIC OPENAI (do sistema)
     const ZIONIC_OPENAI_KEY = process.env.ZIONIC_OPENAI_KEY || process.env.OPENAI_API_KEY;
     
     if (!ZIONIC_OPENAI_KEY) {
       log('error', 'Chave OpenAI do sistema Zionic não configurada');
-      return template.replace('{nome}', contactName);
+      return template.replace('{nome}', context.contact?.first_name || 'usuário');
     }
 
-    const response = await axios.post('https://api.openai.com/v1/chat/completions', {
-      model: 'gpt-4o-mini', // Modelo padrão Zionic
-      messages: [
-        { role: 'system', content: 'Você é um especialista em follow-up de vendas. Seja direto e eficaz.' },
-        { role: 'user', content: prompt }
-      ],
-      max_tokens: 150,
-      temperature: 0.7
-    }, {
-      headers: {
-        'Authorization': `Bearer ${ZIONIC_OPENAI_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      timeout: CONFIG.defaultResponseTimeoutMs
-    });
+    // Verificar créditos Zionic suficientes (estimativa conservadora)
+    const creditsCheck = await checkCreditsBalance(companyId, 300); // Estimativa para threads + assistant
+    if (!creditsCheck.hasEnough) {
+      log('warning', 'Créditos Zionic insuficientes para threads + assistant', {
+        companyId,
+        currentBalance: creditsCheck.currentBalance,
+        required: 300
+      });
+      
+      await notifyZionicCreditsInsufficient(companyId, creditsCheck.currentBalance, 300);
+      return template.replace('{nome}', context.contact?.first_name || 'usuário');
+    }
+
+    // ✅ USAR THREADS PERSISTENTES (igual ao webhook principal)
+    let assistantMessage;
     
-    const generatedMessage = response.data.choices[0]?.message?.content?.trim();
-    
-    if (!generatedMessage) {
-      log('warning', 'IA Zionic não gerou resposta, usando template original');
-      return template.replace('{nome}', contactName);
+    if (agent.openai_assistant_id) {
+      // Modo assistant (preferido)
+      log('debug', 'Usando OpenAI Assistant com threads persistentes', { 
+        assistantId: agent.openai_assistant_id,
+        conversationId: context.conversation.id
+      });
+      
+      assistantMessage = await generateWithAssistantAndThread(
+        ZIONIC_OPENAI_KEY,
+        agent,
+        template,
+        context,
+        companyId
+      );
+    } else {
+      // Fallback: usar thread + modelo direto
+      log('debug', 'Usando thread com modelo direto (fallback)', { 
+        model: agent.openai_model || 'gpt-4o-mini',
+        conversationId: context.conversation.id
+      });
+      
+      assistantMessage = await generateWithThreadOnly(
+        ZIONIC_OPENAI_KEY,
+        agent,
+        template,
+        context,
+        companyId
+      );
     }
     
-    // Processar consumo de créditos Zionic
-    const actualTokensUsed = response.data.usage?.total_tokens || estimatedTokens;
-    const creditSuccess = await processOpenAICreditsUsage(
-      companyId,
-      actualTokensUsed,
-      context.conversation.id,
-      agent.id,
-      `Follow-up Zionic "${agent.name}" - ${actualTokensUsed} tokens`
-    );
-    
-    if (!creditSuccess) {
-      log('warning', 'Falha ao registrar consumo de créditos Zionic (mensagem já gerada)');
+    if (!assistantMessage) {
+      log('warning', 'IA Zionic com threads não gerou resposta, usando template original');
+      return template.replace('{nome}', context.contact?.first_name || 'usuário');
     }
     
-    log('success', 'Mensagem gerada com Zionic Credits', { 
+    log('success', 'Mensagem gerada com Zionic Credits (threads persistentes)', { 
       originalLength: template.length,
-      generatedLength: generatedMessage.length,
-      tokensUsed: actualTokensUsed,
-      creditsProcessed: creditSuccess,
-      mode: 'zionic_credits'
+      generatedLength: assistantMessage.length,
+      mode: 'zionic_credits_threads',
+      hasAssistant: !!agent.openai_assistant_id
     });
     
-    return generatedMessage;
+    return assistantMessage;
     
   } catch (error) {
-    log('error', 'Erro ao gerar mensagem com Zionic Credits', { error: error.message, companyId });
+    log('error', 'Erro ao gerar mensagem com Zionic Credits + threads', { error: error.message, companyId });
     
-    // ✅ NOVO: Criar notificação de erro no sistema Zionic
     await notifyOpenAIError(companyId, { 
       status: error.response?.status,
       message: error.message 
-    }, 'zionic_credits');
+    }, 'master_key');
     
     // Fallback para template original
     const fallbackMessage = template.replace('{nome}', context.contact?.first_name || 'usuário');
-    log('info', 'Usando template fallback após erro Zionic Credits', { fallbackMessage });
+    log('info', 'Usando template fallback após erro Zionic Credits + threads', { fallbackMessage });
     return fallbackMessage;
   }
 }
 
+// ===============================================
+// THREADS PERSISTENTES OPENAI (IGUAL AO WEBHOOK PRINCIPAL)
+// ===============================================
+
 /**
- * Gera mensagem personalizada usando OpenAI com controle de créditos
+ * ✅ NOVO: Gera mensagem usando Assistant + Thread (modo preferido)
  */
-async function generatePersonalizedMessage(template, context, agent, openaiConfig, companyId) {
+async function generateWithAssistantAndThread(apiKey, agent, template, context, companyId) {
   try {
-    log('debug', 'Gerando mensagem personalizada com chave própria da empresa');
+    log('debug', 'Iniciando geração com Assistant + Thread');
     
-    const contactName = context.contact?.first_name || 'usuário';
-    const lastMessages = context.recentMessages
-      .slice(-5) // Últimas 5 mensagens
-      .map(m => `${m.sent_by_ai ? 'Agente' : contactName}: ${m.content}`)
-      .join('\n');
+    // 1. Obter ou criar thread OpenAI
+    const threadId = await getOrCreateOpenAIThread(apiKey, context.conversation.id, agent, {
+      contactName: context.contact?.first_name || 'Cliente',
+      contactPhone: context.contact?.phone || '',
+      contactData: {}
+    });
     
-    const prompt = `
-Você é um assistente de follow-up inteligente. Sua tarefa é reescrever uma mensagem template para reativar uma conversa, baseado no contexto específico da conversa.
+    if (!threadId) {
+      throw new Error('Falha ao criar thread OpenAI');
+    }
+    
+    // 2. Adicionar mensagem específica para follow-up na thread
+    const followUpPrompt = buildFollowUpPrompt(template, context, agent);
+    await addMessageToOpenAIThread(apiKey, threadId, followUpPrompt, 'user');
+    
+    // 3. Executar run do assistant
+    const runResult = await executeOpenAIRun(apiKey, threadId, agent, context.conversation.id, context.contact?.phone || '');
+    
+    if (!runResult.success) {
+      throw new Error(`Run falhou: ${runResult.error}`);
+    }
+    
+    // 4. Obter resposta da thread
+    const assistantMessage = await getLatestAssistantMessage(apiKey, threadId);
+    
+    if (!assistantMessage) {
+      throw new Error('Nenhuma resposta do assistant');
+    }
+    
+    // 5. Processar consumo de créditos (se tiver usage)
+    if (runResult.usage?.total_tokens) {
+      await processOpenAICreditsUsage(
+        companyId,
+        runResult.usage.total_tokens,
+        context.conversation.id,
+        agent.id,
+        `Follow-up Assistant "${agent.name}" - ${runResult.usage.total_tokens} tokens`
+      );
+    }
+    
+    return assistantMessage.trim();
+    
+  } catch (error) {
+    log('error', 'Erro na geração com Assistant + Thread', { error: error.message });
+    throw error;
+  }
+}
 
-AGENTE: ${agent.name}
-TOM: ${agent.tone || 'profissional'}
-IDIOMA: ${agent.language || 'pt-BR'}
+/**
+ * ✅ NOVO: Gera mensagem usando Thread + modelo direto (fallback)
+ */
+async function generateWithThreadOnly(apiKey, agent, template, context, companyId) {
+  try {
+    log('debug', 'Iniciando geração com Thread + modelo direto');
+    
+    // 1. Obter ou criar thread OpenAI
+    const threadId = await getOrCreateOpenAIThread(apiKey, context.conversation.id, agent, {
+      contactName: context.contact?.first_name || 'Cliente',
+      contactPhone: context.contact?.phone || '',
+      contactData: {}
+    });
+    
+    if (!threadId) {
+      throw new Error('Falha ao criar thread OpenAI');
+    }
+    
+    // 2. Adicionar mensagem específica para follow-up na thread
+    const followUpPrompt = buildFollowUpPrompt(template, context, agent);
+    await addMessageToOpenAIThread(apiKey, threadId, followUpPrompt, 'user');
+    
+    // 3. Executar run com modelo direto (sem assistant)
+    const runResult = await executeOpenAIRunWithModel(apiKey, threadId, agent, context.conversation.id);
+    
+    if (!runResult.success) {
+      throw new Error(`Run com modelo falhou: ${runResult.error}`);
+    }
+    
+    // 4. Obter resposta da thread
+    const assistantMessage = await getLatestAssistantMessage(apiKey, threadId);
+    
+    if (!assistantMessage) {
+      throw new Error('Nenhuma resposta do modelo na thread');
+    }
+    
+    // 5. Processar consumo de créditos (se tiver usage)
+    if (runResult.usage?.total_tokens) {
+      await processOpenAICreditsUsage(
+        companyId,
+        runResult.usage.total_tokens,
+        context.conversation.id,
+        agent.id,
+        `Follow-up Thread "${agent.name}" - ${runResult.usage.total_tokens} tokens`
+      );
+    }
+    
+    return assistantMessage.trim();
+    
+  } catch (error) {
+    log('error', 'Erro na geração com Thread + modelo', { error: error.message });
+    throw error;
+  }
+}
 
-TEMPLATE ORIGINAL:
-${template}
+/**
+ * ✅ NOVO: Constrói prompt específico para follow-up
+ */
+function buildFollowUpPrompt(template, context, agent) {
+  const contactName = context.contact?.first_name || 'usuário';
+  const lastMessages = context.recentMessages
+    .slice(-3) // Últimas 3 mensagens (thread já tem o histórico)
+    .map(m => `${m.sent_by_ai ? 'Agente' : contactName}: ${m.content}`)
+    .join('\n');
+  
+  return `FOLLOW-UP AUTOMÁTICO: Você precisa reativar esta conversa que parou de responder.
 
-CONTEXTO DA CONVERSA:
-- Nome do contato: ${contactName}
-- Última mensagem enviada: ${formatDuration(Date.now() - new Date(context.lastMessage?.sent_at || Date.now()).getTime())} atrás
-- Total de mensagens: ${context.messageCount}
-- Conversa prévia (últimas mensagens):
+TEMPLATE ORIGINAL: "${template}"
+
+CONTEXTO ATUAL:
+- Nome: ${contactName}
+- Última interação: ${formatDuration(Date.now() - new Date(context.lastMessage?.sent_at || Date.now()).getTime())} atrás
+- Últimas mensagens:
 ${lastMessages}
 
-INSTRUÇÕES:
-1. Reescreva o template para ser mais específico e contextual
-2. Mencione algo específico da conversa anterior se relevante
-3. Mantenha o tom ${agent.tone || 'profissional'} e ${agent.language || 'português brasileiro'}
-4. Seja natural, não robótico
-5. Máximo 200 caracteres
-6. Não use emojis excessivos
+INSTRUÇÃO: Reescreva o template de forma mais personalizada baseada no contexto da conversa anterior. Seja natural e específico. Máximo 150 caracteres.
 
-Retorne APENAS a mensagem reescrita, sem explicações.`;
+Responda APENAS com a mensagem reescrita, sem explicações.`;
+}
 
-    log('debug', 'Fazendo chamada para OpenAI com chave própria da empresa', {
-      companyId,
-      model: openaiConfig.model || 'gpt-4o-mini'
-    });
-
-    const response = await axios.post('https://api.openai.com/v1/chat/completions', {
-      model: openaiConfig.model || 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: 'Você é um especialista em follow-up de vendas. Seja direto e eficaz.' },
-        { role: 'user', content: prompt }
-      ],
-      max_tokens: 150,
-      temperature: 0.7
-    }, {
+/**
+ * ✅ NOVO: Obter ou criar thread OpenAI (baseado no webhook)
+ */
+async function getOrCreateOpenAIThread(apiKey, conversationId, agent, context) {
+  try {
+    // 1. Verificar se conversa já tem thread
+    const { data: conversation, error } = await supabase
+      .from('conversations')
+      .select('openai_thread_id')
+      .eq('id', conversationId)
+      .single();
+      
+    if (error) {
+      log('error', 'Erro ao buscar thread existente', { error: error.message });
+      return null;
+    }
+    
+    if (conversation?.openai_thread_id) {
+      log('debug', 'Reutilizando thread existente', { threadId: conversation.openai_thread_id });
+      return conversation.openai_thread_id;
+    }
+    
+    // 2. Criar nova thread
+    log('debug', 'Criando nova thread OpenAI');
+    const response = await axios.post('https://api.openai.com/v1/threads', {}, {
       headers: {
-        'Authorization': `Bearer ${openaiConfig.api_key}`,
-        'Content-Type': 'application/json'
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'OpenAI-Beta': 'assistants=v2'
       },
       timeout: CONFIG.defaultResponseTimeoutMs
     });
     
-    const generatedMessage = response.data.choices[0]?.message?.content?.trim();
+    const threadId = response.data.id;
     
-    if (!generatedMessage) {
-      log('warning', 'IA não gerou resposta com chave própria, tentando Zionic Credits');
-      
-      // ✅ NOVO: Notificar sobre problema com chave própria
-      await notifyOpenAIError(companyId, { message: 'Resposta vazia da API' }, 'company_key');
-      
-      // ✅ FALLBACK: Tentar Zionic Credits
-      return await generatePersonalizedMessageWithZionicCredits(template, context, agent, companyId);
-    }
+    // 3. Salvar thread na conversa
+    await supabase
+      .from('conversations')
+      .update({ 
+        openai_thread_id: threadId,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', conversationId);
     
-    log('success', 'Mensagem gerada com chave própria da empresa', { 
-      originalLength: template.length,
-      generatedLength: generatedMessage.length,
-      mode: 'company_key',
-      model: openaiConfig.model || 'gpt-4o-mini'
-    });
+    // 4. Adicionar mensagem de sistema inicial
+    await addSystemMessageToThread(apiKey, threadId, agent, context);
     
-    return generatedMessage;
+    log('success', 'Thread OpenAI criada e salva', { threadId, conversationId });
+    return threadId;
     
   } catch (error) {
-    log('warning', 'Erro com chave própria da empresa, tentando Zionic Credits', { 
-      error: error.message,
-      errorCode: error.response?.status
-    });
-    
-    // ✅ FALLBACK INTELIGENTE: Se chave própria falha (limite atingido, erro 429, etc), usar Zionic Credits
-    if (error.response?.status === 429 || error.message.includes('quota') || error.message.includes('limit')) {
-      log('info', 'Limite da chave própria atingido - usando Zionic Credits automaticamente', { companyId });
-      
-      // ✅ NOVO: Criar notificação específica para quota exceeded
-      await notifyOpenAIQuotaExceeded(companyId, { 
-        status: error.response?.status,
-        message: error.message 
-      });
-      
-      const fallbackResult = await generatePersonalizedMessageWithZionicCredits(template, context, agent, companyId);
-      
-      // ✅ NOVO: Notificar sucesso do fallback se funcionou
-      if (fallbackResult && fallbackResult !== template.replace('{nome}', context.contact?.first_name || 'usuário')) {
-        await notifySuccessfulFallback(companyId, 'company_key', 'zionic_credits');
-      }
-      
-      return fallbackResult;
-    }
-    
-    // ✅ NOVO: Para outros erros, notificar antes do fallback
-    await notifyOpenAIError(companyId, { 
-      status: error.response?.status,
-      message: error.message 
-    }, 'company_key');
-    
-    // Para outros erros, também tentar Zionic Credits
-    return await generatePersonalizedMessageWithZionicCredits(template, context, agent, companyId);
+    log('error', 'Erro ao criar thread OpenAI', { error: error.message });
+    return null;
   }
 }
+
+/**
+ * ✅ NOVO: Adicionar mensagem de sistema à thread
+ */
+async function addSystemMessageToThread(apiKey, threadId, agent, context) {
+  try {
+    const systemPrompt = buildSystemPromptForFollowUp(agent, context);
+    
+    await axios.post(`https://api.openai.com/v1/threads/${threadId}/messages`, {
+      role: 'system',
+      content: systemPrompt
+    }, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'OpenAI-Beta': 'assistants=v2'
+      },
+      timeout: CONFIG.defaultResponseTimeoutMs
+    });
+    
+    log('debug', 'Mensagem de sistema adicionada à thread');
+    
+  } catch (error) {
+    log('error', 'Erro ao adicionar mensagem de sistema', { error: error.message });
+  }
+}
+
+/**
+ * ✅ NOVO: Construir prompt de sistema para follow-up
+ */
+function buildSystemPromptForFollowUp(agent, context) {
+  const now = new Date();
+  const currentDateTime = new Intl.DateTimeFormat('pt-BR', {
+    timeZone: 'America/Sao_Paulo',
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  }).format(now);
+
+  return `Você é ${agent.name}, um assistente especializado em follow-up de vendas.
+
+CONTEXTO: Hoje é ${currentDateTime}
+
+SEU PAPEL: Reativar conversas que pararam de responder através de mensagens personalizadas e relevantes.
+
+INSTRUÇÕES ESPECÍFICAS:
+- Use o contexto da conversa anterior para personalizar mensagens
+- Seja natural e não robótico
+- Mantenha o tom ${agent.tone || 'profissional'}
+- Mencione algo específico da conversa se relevante
+- Máximo 150 caracteres por mensagem
+- Não use emojis em excesso
+
+CONTATO: ${context.contactName}
+TELEFONE: ${context.contactPhone}
+
+Você está trabalhando no modo FOLLOW-UP AUTOMÁTICO.`;
+}
+
+/**
+ * ✅ NOVO: Adicionar mensagem à thread OpenAI
+ */
+async function addMessageToOpenAIThread(apiKey, threadId, content, role) {
+  try {
+    const response = await axios.post(`https://api.openai.com/v1/threads/${threadId}/messages`, {
+      role: role,
+      content: content
+    }, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'OpenAI-Beta': 'assistants=v2'
+      },
+      timeout: CONFIG.defaultResponseTimeoutMs
+    });
+    
+    log('debug', `Mensagem ${role} adicionada à thread`, { threadId });
+    
+  } catch (error) {
+    log('error', 'Erro ao adicionar mensagem à thread', { error: error.message });
+    throw error;
+  }
+}
+
+/**
+ * ✅ NOVO: Executar run OpenAI com assistant
+ */
+async function executeOpenAIRun(apiKey, threadId, agent, conversationId, contactPhone) {
+  try {
+    log('debug', 'Iniciando run OpenAI com assistant');
+    
+    const runPayload = {
+      assistant_id: agent.openai_assistant_id
+    };
+    
+    const runResponse = await axios.post(`https://api.openai.com/v1/threads/${threadId}/runs`, runPayload, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'OpenAI-Beta': 'assistants=v2'
+      },
+      timeout: CONFIG.defaultResponseTimeoutMs
+    });
+    
+    const runId = runResponse.data.id;
+    let status = runResponse.data.status;
+    
+    log('debug', 'Run iniciado', { runId, status });
+    
+    // Poll para completar
+    let attempts = 0;
+    const maxAttempts = 30;
+    
+    while (status !== 'completed' && status !== 'failed' && attempts < maxAttempts) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      attempts++;
+      
+      const statusResponse = await axios.get(`https://api.openai.com/v1/threads/${threadId}/runs/${runId}`, {
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'OpenAI-Beta': 'assistants=v2'
+        },
+        timeout: CONFIG.defaultResponseTimeoutMs
+      });
+      
+      status = statusResponse.data.status;
+      log('debug', `Status do run: ${status} (tentativa ${attempts})`);
+      
+      if (status === 'failed') {
+        return { 
+          success: false, 
+          error: statusResponse.data.last_error?.message || 'Run falhou' 
+        };
+      }
+    }
+    
+    if (status === 'completed') {
+      // Buscar dados finais do run para pegar usage
+      const finalResponse = await axios.get(`https://api.openai.com/v1/threads/${threadId}/runs/${runId}`, {
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'OpenAI-Beta': 'assistants=v2'
+        },
+        timeout: CONFIG.defaultResponseTimeoutMs
+      });
+      
+      return { 
+        success: true, 
+        usage: finalResponse.data.usage 
+      };
+    } else {
+      return { 
+        success: false, 
+        error: 'Timeout ou falha no run' 
+      };
+    }
+    
+  } catch (error) {
+    log('error', 'Erro ao executar run OpenAI', { error: error.message });
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * ✅ NOVO: Executar run OpenAI com modelo direto
+ */
+async function executeOpenAIRunWithModel(apiKey, threadId, agent, conversationId) {
+  try {
+    log('debug', 'Iniciando run OpenAI com modelo direto');
+    
+    const runPayload = {
+      model: agent.openai_model || 'gpt-4o-mini',
+      temperature: agent.temperature ?? 0.7,
+      max_tokens: agent.max_tokens || 200,
+      instructions: buildSystemPromptForFollowUp(agent, {
+        contactName: 'Cliente',
+        contactPhone: ''
+      })
+    };
+    
+    const runResponse = await axios.post(`https://api.openai.com/v1/threads/${threadId}/runs`, runPayload, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'OpenAI-Beta': 'assistants=v2'
+      },
+      timeout: CONFIG.defaultResponseTimeoutMs
+    });
+    
+    const runId = runResponse.data.id;
+    let status = runResponse.data.status;
+    
+    log('debug', 'Run com modelo iniciado', { runId, status, model: runPayload.model });
+    
+    // Poll para completar (mesmo processo)
+    let attempts = 0;
+    const maxAttempts = 30;
+    
+    while (status !== 'completed' && status !== 'failed' && attempts < maxAttempts) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      attempts++;
+      
+      const statusResponse = await axios.get(`https://api.openai.com/v1/threads/${threadId}/runs/${runId}`, {
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'OpenAI-Beta': 'assistants=v2'
+        },
+        timeout: CONFIG.defaultResponseTimeoutMs
+      });
+      
+      status = statusResponse.data.status;
+      log('debug', `Status do run modelo: ${status} (tentativa ${attempts})`);
+      
+      if (status === 'failed') {
+        return { 
+          success: false, 
+          error: statusResponse.data.last_error?.message || 'Run com modelo falhou' 
+        };
+      }
+    }
+    
+    if (status === 'completed') {
+      // Buscar dados finais do run para pegar usage
+      const finalResponse = await axios.get(`https://api.openai.com/v1/threads/${threadId}/runs/${runId}`, {
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'OpenAI-Beta': 'assistants=v2'
+        },
+        timeout: CONFIG.defaultResponseTimeoutMs
+      });
+      
+      return { 
+        success: true, 
+        usage: finalResponse.data.usage 
+      };
+    } else {
+      return { 
+        success: false, 
+        error: 'Timeout ou falha no run com modelo' 
+      };
+    }
+    
+  } catch (error) {
+    log('error', 'Erro ao executar run com modelo', { error: error.message });
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * ✅ NOVO: Obter última mensagem do assistant da thread
+ */
+async function getLatestAssistantMessage(apiKey, threadId) {
+  try {
+    const response = await axios.get(`https://api.openai.com/v1/threads/${threadId}/messages?order=desc&limit=1`, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'OpenAI-Beta': 'assistants=v2'
+      },
+      timeout: CONFIG.defaultResponseTimeoutMs
+    });
+    
+    const messages = response.data.data;
+    
+    for (const message of messages) {
+      if (message.role === 'assistant' && message.content?.length > 0) {
+        const textContent = message.content.find(c => c.type === 'text');
+        if (textContent?.text?.value) {
+          return textContent.text.value;
+        }
+      }
+    }
+    
+    return null;
+    
+  } catch (error) {
+    log('error', 'Erro ao obter mensagem do assistant', { error: error.message });
+    return null;
+  }
+}
+
+
 
 // ===============================================
 // CORE: ENVIO VIA WHATSAPP
@@ -851,6 +1112,46 @@ async function processFollowUp(followUp) {
       conversationId: followUp.conversation_id
     });
     
+    // ✅ PROTEÇÃO EXTRA: Verificar se follow-up ainda está pendente (evitar race conditions)
+    const { data: currentStatus, error: statusError } = await supabase
+      .from('follow_up_queue')
+      .select('status, attempts')
+      .eq('id', followUp.id)
+      .single();
+    
+    if (statusError || !currentStatus) {
+      throw new Error('Follow-up não encontrado ou já foi removido');
+    }
+    
+    if (currentStatus.status !== 'pending') {
+      log('warning', 'Follow-up não está mais pendente, pulando', { 
+        followUpId: followUp.id,
+        currentStatus: currentStatus.status,
+        reason: 'status_changed_before_processing'
+      });
+      return { success: true, skipped: true, reason: 'status_changed' };
+    }
+    
+    // ✅ PROTEÇÃO CONTRA MAX ATTEMPTS: Verificar se ainda pode tentar
+    if (currentStatus.attempts >= followUp.max_attempts) {
+      log('warning', 'Follow-up já atingiu máximo de tentativas', { 
+        followUpId: followUp.id,
+        currentAttempts: currentStatus.attempts,
+        maxAttempts: followUp.max_attempts
+      });
+      
+      // Marcar como failed
+      await supabase
+        .from('follow_up_queue')
+        .update({ 
+          status: 'failed',
+          execution_error: `Máximo de ${followUp.max_attempts} tentativas atingido`
+        })
+        .eq('id', followUp.id);
+        
+      return { success: false, error: 'Max attempts reached' };
+    }
+    
     // ✅ VERIFICAÇÃO DE SEGURANÇA: Garantir que company_id existe
     if (!followUp.company_id) {
       log('error', 'Follow-up sem company_id - buscando do agente', { followUpId: followUp.id });
@@ -925,49 +1226,29 @@ async function processFollowUp(followUp) {
       return { success: true, deferred: true };
     }
     
-    // 4. Buscar configuração OpenAI da empresa
-    const openaiConfig = await getCompanyOpenAIConfig(followUp.company_id);
-    
-    // 5. ✅ SISTEMA DE FALLBACK INTELIGENTE
+    // 4. ✅ USAR APENAS MASTER KEY (simplificado)
     let finalMessage = followUp.message_template;
     
-    if (openaiConfig) {
-      // Empresa tem chave própria configurada - tentar usar primeiro
-      log('info', 'Empresa tem chave OpenAI própria - modo premium', { 
-        companyId: followUp.company_id,
-        model: openaiConfig.model 
-      });
-      
-      finalMessage = await generatePersonalizedMessage(
-        followUp.message_template,
-        context,
-        agent,
-        openaiConfig,
-        followUp.company_id
-      );
-    } else {
-      // ✅ FALLBACK INTELIGENTE: Empresa não tem chave própria - usar Zionic Credits
-      log('info', 'Empresa sem chave OpenAI própria - usando Zionic Credits', { 
-        companyId: followUp.company_id 
-      });
-      
-      finalMessage = await generatePersonalizedMessageWithZionicCredits(
-        followUp.message_template,
-        context,
-        agent,
-        followUp.company_id
-      );
-      
-      // ✅ NOVO: Se gerou mensagem IA com sucesso (não é só replace), informar que modo básico está funcionando
-      if (finalMessage && finalMessage !== followUp.message_template.replace('{nome}', context.contact?.first_name || 'usuário')) {
-        log('debug', 'Follow-up gerado com sucesso via Zionic Credits (modo básico)');
-        // Não criar notificação aqui para não poluir, apenas log para debug
-      }
+    log('info', 'Usando master key OpenAI para follow-up', { 
+      companyId: followUp.company_id,
+      agentName: agent.name
+    });
+    
+    finalMessage = await generatePersonalizedMessageWithZionicCredits(
+      followUp.message_template,
+      context,
+      agent,
+      followUp.company_id
+    );
+    
+    // ✅ Log de sucesso se personalizou (não é só replace)
+    if (finalMessage && finalMessage !== followUp.message_template.replace('{nome}', context.contact?.first_name || 'usuário')) {
+      log('debug', 'Follow-up personalizado com sucesso via master key + threads');
     }
     
     executionLog.message_sent = finalMessage;
     
-    // 6. Buscar nome da instância WhatsApp (simplificado)
+    // 5. Buscar nome da instância WhatsApp (simplificado)
     const { data: instance, error: instanceError } = await supabase
       .from('whatsapp_instances')
       .select('name')
@@ -979,7 +1260,7 @@ async function processFollowUp(followUp) {
       throw new Error('Instância WhatsApp ativa não encontrada');
     }
     
-    // 7. Enviar mensagem via Evolution ENV VARS
+    // 6. Enviar mensagem via Evolution ENV VARS
     const sendResult = await sendWhatsAppMessage(
       instance.name,
       context.contact.phone,
@@ -990,7 +1271,7 @@ async function processFollowUp(followUp) {
       throw new Error(sendResult.error);
     }
     
-    // 8. Marcar como enviado
+    // 7. Marcar como enviado
     await supabase
       .from('follow_up_queue')
       .update({ 
@@ -1001,7 +1282,7 @@ async function processFollowUp(followUp) {
       })
       .eq('id', followUp.id);
     
-    // 9. Registrar mensagem no sistema
+    // 8. Registrar mensagem no sistema
     // ✅ CORRIGIDO: Usar mesmo formato do webhook para garantir compatibilidade com ChatWindow
     const messageData = {
       conversation_id: followUp.conversation_id,
@@ -1136,8 +1417,8 @@ async function findAndCreateOrphanedFollowUps() {
     // ✅ Limpeza automática antes da detecção
     await cleanupOldFailedFollowUps();
     
-    // ✅ NOVA ABORDAGEM: Usar função SQL otimizada
-    const { data: orphanedFollowUps, error } = await supabase.rpc('create_orphaned_follow_ups', {
+    // ✅ CORRIGIDO: Usar função SQL corrigida que verifica status
+    const { data: orphanedFollowUps, error } = await supabase.rpc('create_orphaned_follow_ups_fixed', {
       p_limit: 1000,  // Até 1000 follow-ups órfãos por execução
       p_days_back: 7   // Últimos 7 dias
     });
@@ -1153,7 +1434,7 @@ async function findAndCreateOrphanedFollowUps() {
     }
 
     log('success', `✅ Detecção SQL concluída: ${orphanedFollowUps.length} follow-ups órfãos criados`, {
-      method: 'sql_optimized',
+      method: 'sql_optimized_fixed',
       orphansCreated: orphanedFollowUps.length,
       averageLateness: orphanedFollowUps.reduce((acc, f) => acc + (f.minutes_late || 0), 0) / orphanedFollowUps.length
     });
@@ -1270,7 +1551,7 @@ function startStatusEndpoint() {
     res.json({
       status: 'running',
       service: 'Zionic Follow-up Server',
-      version: '1.5.0', // ✅ OTIMIZAÇÃO: Detecção SQL eficiente de órfãos
+      version: '1.6.0', // ✅ CORREÇÃO CRÍTICA: Fix loop infinito de follow-ups
       uptime: formatDuration(Date.now() - stats.serverStartTime),
       stats: {
         ...stats,
@@ -1281,7 +1562,17 @@ function startStatusEndpoint() {
         creditsControl: true,
         intelligentFallback: true, // ✅ NOVO: Fallback inteligente OpenAI
         systemNotifications: true, // ✅ NOVO: Notificações automáticas
+        loopPrevention: true, // ✅ NOVO: Prevenção de loop infinito
+        persistentThreads: true, // ✅ NOVO: Threads persistentes OpenAI
+        masterKeyOnly: true, // ✅ NOVO: Apenas master key (sem chave própria)
         intervalMinutes: CONFIG.executionIntervalMinutes
+      },
+      fixes: {
+        v16: 'Correção crítica: loop infinito + threads persistentes + master key only',
+        duplicatePrevention: 'SQL corrigida para evitar duplicatas',
+        raceConditionFix: 'Proteção contra race conditions',
+        threadsConsistency: 'Threads persistentes igual webhook principal',
+        simplification: 'Removidas chaves próprias - apenas master key'
       },
       timestamp: new Date().toISOString()
     });
@@ -1420,30 +1711,7 @@ async function createSystemNotification(companyId, type, title, message, severit
   }
 }
 
-/**
- * Cria notificação quando chave própria da empresa falha por quota
- */
-async function notifyOpenAIQuotaExceeded(companyId, errorDetails = {}) {
-  const title = '🚨 Limite OpenAI Atingido';
-  const message = 'Sua chave OpenAI atingiu o limite de quota. Os follow-ups estão sendo processados automaticamente usando Zionic Credits para garantir continuidade.';
-  
-  const metadata = {
-    help_url: 'https://platform.openai.com/account/billing',
-    fallback_active: true,
-    error_code: errorDetails.status || 429,
-    timestamp: new Date().toISOString(),
-    solution: 'automatic_fallback_to_zionic_credits'
-  };
 
-  await createSystemNotification(
-    companyId,
-    'openai_quota_exceeded',
-    title,
-    message,
-    'high',
-    metadata
-  );
-}
 
 /**
  * Cria notificação quando Zionic Credits estão insuficientes
@@ -1473,55 +1741,26 @@ async function notifyZionicCreditsInsufficient(companyId, currentBalance, requir
 /**
  * Cria notificação quando há erro crítico com OpenAI
  */
-async function notifyOpenAIError(companyId, errorDetails, mode = 'company_key') {
-  const isCompanyKey = mode === 'company_key';
-  const title = isCompanyKey ? '⚠️ Erro na Chave OpenAI' : '⚠️ Erro no Sistema IA';
-  
-  const message = isCompanyKey 
-    ? 'Erro na sua chave OpenAI. Follow-ups continuam funcionando via Zionic Credits.'
-    : 'Erro no sistema de IA. Follow-ups usarão templates simples temporariamente.';
+async function notifyOpenAIError(companyId, errorDetails, mode = 'master_key') {
+  const title = '⚠️ Erro no Sistema IA';
+  const message = 'Erro temporário no sistema de IA. Follow-ups usarão templates simples até resolver.';
   
   const metadata = {
     error_message: errorDetails.message || 'Erro desconhecido',
     error_code: errorDetails.status || 500,
-    mode: mode,
+    system: 'master_key_threads',
     timestamp: new Date().toISOString(),
-    help_url: isCompanyKey ? 'https://platform.openai.com/account/api-keys' : null,
     fallback_active: true
   };
 
-  const severity = isCompanyKey ? 'medium' : 'high';
-
   await createSystemNotification(
     companyId,
-    'openai_error',
+    'master_key_error',
     title,
     message,
-    severity,
+    'high',
     metadata
   );
 }
 
-/**
- * Cria notificação de sucesso quando fallback funciona perfeitamente
- */
-async function notifySuccessfulFallback(companyId, fromMode, toMode) {
-  const title = '✅ Sistema de Backup Ativado';
-  const message = `Transição automática de ${fromMode === 'company_key' ? 'chave própria' : 'sistema'} para ${toMode === 'zionic_credits' ? 'Zionic Credits' : 'template'} concluída com sucesso.`;
-  
-  const metadata = {
-    from_mode: fromMode,
-    to_mode: toMode,
-    timestamp: new Date().toISOString(),
-    auto_fallback: true
-  };
-
-  await createSystemNotification(
-    companyId,
-    'fallback_success',
-    title,
-    message,
-    'info',
-    metadata
-  );
-} 
+ 
