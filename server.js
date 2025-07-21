@@ -1203,6 +1203,40 @@ async function processFollowUp(followUp) {
       return { success: true, skipped: true, reason: 'status_changed' };
     }
     
+    // ✅ NOVA PROTEÇÃO CRÍTICA: Verificar se conversa está com follow-ups pausados
+    const { data: conversation, error: convPauseError } = await supabase
+      .from('conversations')
+      .select('metadata')
+      .eq('id', followUp.conversation_id)
+      .single();
+    
+    if (!convPauseError && conversation?.metadata?.follow_up_paused === true) {
+      log('warning', 'Follow-up cancelado - conversa tem follow-ups pausados', { 
+        followUpId: followUp.id,
+        conversationId: followUp.conversation_id,
+        pausedAt: conversation.metadata.follow_up_paused_at,
+        pausedBy: conversation.metadata.follow_up_paused_by,
+        reason: 'conversation_follow_ups_paused'
+      });
+      
+      // Marcar follow-up como cancelado
+      await supabase
+        .from('follow_up_queue')
+        .update({ 
+          status: 'cancelled',
+          execution_error: 'Conversa com follow-ups pausados manualmente',
+          metadata: {
+            ...followUp.metadata,
+            cancelled_reason: 'conversation_paused',
+            cancelled_at: new Date().toISOString(),
+            paused_by_user: conversation.metadata.follow_up_paused_by
+          }
+        })
+        .eq('id', followUp.id);
+        
+      return { success: true, skipped: true, reason: 'conversation_paused' };
+    }
+    
     // ✅ PROTEÇÃO CONTRA MAX ATTEMPTS: Verificar se ainda pode tentar
     if (currentStatus.attempts >= followUp.max_attempts) {
       log('warning', 'Follow-up já atingiu máximo de tentativas', { 
@@ -1724,7 +1758,7 @@ function startStatusEndpoint() {
     res.json({
       status: 'running',
       service: 'Zionic Follow-up Server',
-      version: '1.6.3', // ✅ CORREÇÃO DEFINITIVA: Loop infinito por trigger corrigido
+      version: '1.6.4', // ✅ RESPEITO À PAUSA: Servidor agora respeita follow-ups pausados pelo usuário
       uptime: formatDuration(Date.now() - stats.serverStartTime),
       stats: {
         ...stats,
@@ -1741,13 +1775,13 @@ function startStatusEndpoint() {
         intervalMinutes: CONFIG.executionIntervalMinutes
       },
       fixes: {
-        v163: 'CORREÇÃO DEFINITIVA: Loop infinito causado pelo trigger de follow-up',
+        v164: 'RESPEITO À PAUSA: Servidor agora respeita follow-ups pausados pelo usuário',
+        pauseRespect: 'Verificação de conversations.metadata.follow_up_paused antes do processamento',
+        conversationPauseDetection: 'Follow-ups cancelados automaticamente se conversa pausada',
         triggerLoopFix: 'Trigger ignora mensagens enviadas pelo follow-up server',
         metadataExclusion: 'Mensagens com is_follow_up=true são ignoradas pelo trigger',
-        autoCleanup: 'Limpeza automática de follow-ups duplicados/órfãos',
         timezoneCorrect: 'Horário comercial baseado no timezone da empresa',
-        threadsConsistency: 'Threads persistentes igual webhook principal',
-        masterKeyOnly: 'Removidas chaves próprias - apenas master key'
+        threadsConsistency: 'Threads persistentes igual webhook principal'
       },
       timestamp: new Date().toISOString()
     });
