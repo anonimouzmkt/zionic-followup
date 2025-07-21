@@ -122,12 +122,83 @@ function log(level, message, data = {}) {
 }
 
 /**
- * Verifica se está dentro do horário comercial
+ * ✅ CORRIGIDO: Verifica se está dentro do horário comercial considerando timezone da empresa
  */
-function isBusinessHours() {
-  const now = new Date();
-  const hour = now.getHours();
-  return hour >= CONFIG.businessHours.start && hour < CONFIG.businessHours.end;
+async function isBusinessHours(companyId) {
+  try {
+    // ✅ Buscar timezone da empresa ou usuário
+    const timezone = await getCompanyTimezone(companyId);
+    
+    // ✅ Obter hora atual no timezone da empresa
+    const now = new Date();
+    const companyTime = new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone,
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    }).format(now);
+    
+    const currentHour = parseInt(companyTime.split(':')[0]);
+    
+    log('debug', 'Verificação de horário comercial', {
+      companyId,
+      timezone,
+      serverTime: now.toISOString(),
+      companyTime,
+      currentHour,
+      businessStart: CONFIG.businessHours.start,
+      businessEnd: CONFIG.businessHours.end,
+      isWithinHours: currentHour >= CONFIG.businessHours.start && currentHour < CONFIG.businessHours.end
+    });
+    
+    return currentHour >= CONFIG.businessHours.start && currentHour < CONFIG.businessHours.end;
+    
+  } catch (error) {
+    log('error', 'Erro ao verificar horário comercial', { error: error.message, companyId });
+    // Fallback: assumir horário comercial em caso de erro
+    return true;
+  }
+}
+
+/**
+ * ✅ NOVO: Busca timezone da empresa ou usuário
+ */
+async function getCompanyTimezone(companyId) {
+  try {
+    // 1. Tentar buscar timezone da empresa primeiro
+    const { data: company, error: companyError } = await supabase
+      .from('companies')
+      .select('timezone')
+      .eq('id', companyId)
+      .single();
+    
+    if (!companyError && company?.timezone) {
+      log('debug', 'Timezone encontrado na empresa', { companyId, timezone: company.timezone });
+      return company.timezone;
+    }
+    
+    // 2. Se não encontrar na empresa, buscar do usuário admin/owner da empresa
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('timezone')
+      .eq('company_id', companyId)
+      .eq('is_owner', true)
+      .single();
+    
+    if (!userError && user?.timezone) {
+      log('debug', 'Timezone encontrado no usuário owner', { companyId, timezone: user.timezone });
+      return user.timezone;
+    }
+    
+    // 3. Fallback para timezone padrão brasileiro
+    log('debug', 'Usando timezone padrão (fallback)', { companyId, timezone: 'America/Sao_Paulo' });
+    return 'America/Sao_Paulo';
+    
+  } catch (error) {
+    log('error', 'Erro ao buscar timezone da empresa', { error: error.message, companyId });
+    return 'America/Sao_Paulo';
+  }
 }
 
 /**
@@ -1208,19 +1279,51 @@ async function processFollowUp(followUp) {
     const followUpRules = agent.follow_up_rules || [];
     const rule = followUpRules.find(r => r.id === followUp.rule_id);
     
-    if (rule?.conditions?.exclude_business_hours && !isBusinessHours()) {
-      log('info', 'Follow-up adiado - fora do horário comercial', { followUpId: followUp.id });
+    if (rule?.conditions?.exclude_business_hours && !(await isBusinessHours(followUp.company_id))) {
+      log('info', 'Follow-up adiado - fora do horário comercial da empresa', { 
+        followUpId: followUp.id,
+        companyId: followUp.company_id,
+        timezone: await getCompanyTimezone(followUp.company_id)
+      });
       
-      // Reagendar para próximo horário comercial
+      // ✅ CORRIGIDO: Reagendar considerando timezone da empresa
+      const timezone = await getCompanyTimezone(followUp.company_id);
       const nextBusinessHour = new Date();
-      nextBusinessHour.setHours(CONFIG.businessHours.start, 0, 0, 0);
-      if (nextBusinessHour <= new Date()) {
+      
+      // Calcular próximo horário comercial no timezone da empresa
+      const companyTime = new Intl.DateTimeFormat('en-CA', {
+        timeZone: timezone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false
+      }).format(nextBusinessHour);
+      
+      const companyHour = parseInt(companyTime.split(' ')[1].split(':')[0]);
+      
+      // Se já passou do horário comercial hoje, agendar para amanhã
+      if (companyHour >= CONFIG.businessHours.end) {
         nextBusinessHour.setDate(nextBusinessHour.getDate() + 1);
       }
       
+      // Criar uma data no timezone da empresa para o próximo horário comercial
+      const nextBusinessHourLocal = new Date(nextBusinessHour);
+      nextBusinessHourLocal.setHours(CONFIG.businessHours.start, 0, 0, 0);
+      
       await supabase
         .from('follow_up_queue')
-        .update({ scheduled_at: nextBusinessHour.toISOString() })
+        .update({ 
+          scheduled_at: nextBusinessHourLocal.toISOString(),
+          metadata: {
+            ...followUp.metadata,
+            rescheduled_reason: 'outside_business_hours',
+            company_timezone: timezone,
+            original_scheduled_at: followUp.scheduled_at
+          }
+        })
         .eq('id', followUp.id);
         
       return { success: true, deferred: true };
@@ -1621,7 +1724,7 @@ function startStatusEndpoint() {
     res.json({
       status: 'running',
       service: 'Zionic Follow-up Server',
-      version: '1.6.1', // ✅ CORREÇÃO ULTRA ROBUSTA: Loop infinito + verificação tripla
+      version: '1.6.2', // ✅ CORREÇÃO TIMEZONE: Horário comercial baseado no timezone da empresa
       uptime: formatDuration(Date.now() - stats.serverStartTime),
       stats: {
         ...stats,
@@ -1638,9 +1741,10 @@ function startStatusEndpoint() {
         intervalMinutes: CONFIG.executionIntervalMinutes
       },
       fixes: {
-        v161: 'ULTRA ROBUSTA: Verificação tripla para eliminar loop infinito definitivamente',
+        v162: 'CORREÇÃO TIMEZONE: Horário comercial baseado no timezone da empresa/usuário',
+        timezoneDetection: 'Busca timezone da empresa ou usuário owner automaticamente',
+        businessHoursCorrect: 'Cálculo correto de horário comercial por timezone',
         tripleVerification: 'NOT EXISTS para pending, sent e completed recentes',
-        robustDebugging: 'Logs detalhados para rastrear duplicatas',
         threadsConsistency: 'Threads persistentes igual webhook principal',
         masterKeyOnly: 'Removidas chaves próprias - apenas master key',
         realTimeChecks: 'Verificação de status em tempo real'
