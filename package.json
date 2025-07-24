@@ -1,7 +1,7 @@
 {
   "name": "zionic-followup-server",
-  "version": "1.6.4",
-  "description": "Servidor automático de follow-up para reativação de leads inativos",
+  "version": "1.7.0",
+  "description": "Servidor automático de follow-up e lembretes de appointments com threads persistentes",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -24,7 +24,9 @@
     "whatsapp",
     "openai",
     "supabase",
-    "zionic"
+    "zionic",
+    "appointment-reminders",
+    "persistent-threads"
   ],
   "author": "Zionic Team",
   "license": "MIT",
