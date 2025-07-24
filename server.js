@@ -88,7 +88,9 @@ const CONFIG = {
 let stats = {
   totalExecutions: 0,
   totalFollowUpsSent: 0,
-  totalOrphansCreated: 0, // ✅ NOVO: Contador de órfãos criados
+  totalOrphansCreated: 0,
+  totalRemindersSent: 0, // ✅ NOVO: Contador de lembretes enviados
+  totalRemindersCreated: 0, // ✅ NOVO: Contador de lembretes criados
   totalErrors: 0,
   lastExecution: null,
   serverStartTime: new Date(),
@@ -606,11 +608,11 @@ function estimateTokensFromText(text) {
 // ===============================================
 
 /**
- * ✅ NOVO: Gera lembrete de appointment personalizado usando Zionic Credits
+ * ✅ ATUALIZADO: Gera lembrete de appointment personalizado usando Zionic Credits com THREADS PERSISTENTES
  */
 async function generatePersonalizedAppointmentReminderWithZionicCredits(template, reminderContext, agent, companyId) {
   try {
-    log('info', 'Gerando lembrete de appointment com Zionic Credits', { companyId });
+    log('info', 'Gerando lembrete de appointment com Zionic Credits usando threads persistentes', { companyId });
     
     const ZIONIC_OPENAI_KEY = process.env.ZIONIC_OPENAI_KEY || process.env.OPENAI_API_KEY;
     
@@ -619,43 +621,68 @@ async function generatePersonalizedAppointmentReminderWithZionicCredits(template
       return template;
     }
 
-    // Verificar créditos Zionic suficientes
-    const creditsCheck = await checkCreditsBalance(companyId, 200);
+    // Verificar créditos Zionic suficientes (estimativa conservadora para threads + assistant)
+    const creditsCheck = await checkCreditsBalance(companyId, 300);
     if (!creditsCheck.hasEnough) {
-      log('warning', 'Créditos Zionic insuficientes para personalizar lembrete', {
+      log('warning', 'Créditos Zionic insuficientes para threads + assistant', {
         companyId,
         currentBalance: creditsCheck.currentBalance,
-        required: 200
+        required: 300
       });
       
-      await notifyZionicCreditsInsufficient(companyId, creditsCheck.currentBalance, 200);
+      await notifyZionicCreditsInsufficient(companyId, creditsCheck.currentBalance, 300);
       return template;
     }
 
-    // Usar geração direta para lembretes (mais simples que threads)
-    const personalizedMessage = await generateAppointmentReminderDirectly(
-      ZIONIC_OPENAI_KEY,
-      agent,
-      template,
-      reminderContext,
-      companyId
-    );
+    // ✅ USAR THREADS PERSISTENTES (igual aos follow-ups)
+    let assistantMessage;
     
-    if (!personalizedMessage) {
-      log('warning', 'IA Zionic não gerou lembrete personalizado, usando template original');
+    if (agent.openai_assistant_id) {
+      // Modo assistant (preferido)
+      log('debug', 'Usando OpenAI Assistant com threads persistentes para lembrete', { 
+        assistantId: agent.openai_assistant_id,
+        appointmentTitle: reminderContext.appointmentTitle
+      });
+      
+      assistantMessage = await generateAppointmentReminderWithAssistantAndThread(
+        ZIONIC_OPENAI_KEY,
+        agent,
+        template,
+        reminderContext,
+        companyId
+      );
+    } else {
+      // Fallback: usar thread + modelo direto
+      log('debug', 'Usando thread com modelo direto para lembrete (fallback)', { 
+        model: agent.openai_model || 'gpt-4o-mini',
+        appointmentTitle: reminderContext.appointmentTitle
+      });
+      
+      assistantMessage = await generateAppointmentReminderWithThreadOnly(
+        ZIONIC_OPENAI_KEY,
+        agent,
+        template,
+        reminderContext,
+        companyId
+      );
+    }
+    
+    if (!assistantMessage) {
+      log('warning', 'IA Zionic com threads não gerou lembrete, usando template original');
       return template;
     }
     
-    log('success', 'Lembrete personalizado com Zionic Credits', { 
+    log('success', 'Lembrete personalizado com Zionic Credits (threads persistentes)', { 
       originalLength: template.length,
-      generatedLength: personalizedMessage.length,
-      mode: 'direct_appointment_reminder'
+      generatedLength: assistantMessage.length,
+      mode: 'zionic_credits_threads_reminder',
+      hasAssistant: !!agent.openai_assistant_id
     });
     
-    return personalizedMessage;
+    return assistantMessage;
     
   } catch (error) {
-    log('error', 'Erro ao gerar lembrete personalizado com Zionic Credits', { 
+    log('error', 'Erro ao gerar lembrete com Zionic Credits + threads', { 
       error: error.message, 
       companyId 
     });
@@ -663,80 +690,273 @@ async function generatePersonalizedAppointmentReminderWithZionicCredits(template
     await notifyOpenAIError(companyId, { 
       status: error.response?.status,
       message: error.message 
-    }, 'appointment_reminder');
+    }, 'appointment_reminder_threads');
     
-    return template;
+    // Fallback para template original
+    const fallbackMessage = template;
+    log('info', 'Usando template fallback após erro Zionic Credits + threads', { fallbackMessage });
+    return fallbackMessage;
+  }
+}
+
+// ===============================================
+// ✅ NOVO: THREADS PERSISTENTES PARA LEMBRETES DE APPOINTMENTS
+// ===============================================
+
+/**
+ * ✅ NOVO: Gera lembrete usando Assistant + Thread (modo preferido)
+ */
+async function generateAppointmentReminderWithAssistantAndThread(apiKey, agent, template, reminderContext, companyId) {
+  try {
+    log('debug', 'Iniciando geração de lembrete com Assistant + Thread');
+    
+    // 1. Gerar thread ID único para o lembrete (baseado no appointment)
+    const threadId = await getOrCreateAppointmentReminderThread(
+      apiKey, 
+      reminderContext.appointmentId || 'reminder-' + Date.now(), 
+      agent, 
+      reminderContext
+    );
+    
+    if (!threadId) {
+      throw new Error('Falha ao criar thread OpenAI para lembrete');
+    }
+    
+    // 2. Adicionar mensagem específica para lembrete na thread
+    const reminderPrompt = buildAppointmentReminderPrompt(template, reminderContext, agent);
+    await addMessageToOpenAIThread(apiKey, threadId, reminderPrompt, 'user');
+    
+    // 3. Executar run do assistant
+    const runResult = await executeOpenAIRun(apiKey, threadId, agent, reminderContext.appointmentId, reminderContext.contactPhone || '');
+    
+    if (!runResult.success) {
+      throw new Error(`Run falhou: ${runResult.error}`);
+    }
+    
+    // 4. Obter resposta da thread
+    const assistantMessage = await getLatestAssistantMessage(apiKey, threadId);
+    
+    if (!assistantMessage) {
+      throw new Error('Nenhuma resposta do assistant para lembrete');
+    }
+    
+    // 5. Processar consumo de créditos (se tiver usage)
+    if (runResult.usage?.total_tokens) {
+      await processOpenAICreditsUsage(
+        companyId,
+        runResult.usage.total_tokens,
+        reminderContext.appointmentId || 'appointment-reminder',
+        agent.id,
+        `Lembrete Assistant "${agent.name}" - ${runResult.usage.total_tokens} tokens`
+      );
+    }
+    
+    return assistantMessage.trim();
+    
+  } catch (error) {
+    log('error', 'Erro na geração de lembrete com Assistant + Thread', { error: error.message });
+    throw error;
   }
 }
 
 /**
- * ✅ NOVO: Gera lembrete diretamente sem threads (mais eficiente para lembretes)
+ * ✅ NOVO: Gera lembrete usando Thread + modelo direto (fallback)
  */
-async function generateAppointmentReminderDirectly(apiKey, agent, template, reminderContext, companyId) {
+async function generateAppointmentReminderWithThreadOnly(apiKey, agent, template, reminderContext, companyId) {
   try {
-    const appointmentDate = new Date(reminderContext.appointmentDate);
-    const dataFormatada = appointmentDate.toLocaleDateString('pt-BR');
-    const horarioFormatado = appointmentDate.toLocaleTimeString('pt-BR', { 
-      hour: '2-digit', 
-      minute: '2-digit' 
-    });
+    log('debug', 'Iniciando geração de lembrete com Thread + modelo direto');
     
-    const systemPrompt = `Você é ${agent.name}, um assistente especializado em lembretes de appointments.
+    // 1. Gerar thread ID único para o lembrete
+    const threadId = await getOrCreateAppointmentReminderThread(
+      apiKey, 
+      reminderContext.appointmentId || 'reminder-' + Date.now(), 
+      agent, 
+      reminderContext
+    );
+    
+    if (!threadId) {
+      throw new Error('Falha ao criar thread OpenAI para lembrete');
+    }
+    
+    // 2. Adicionar mensagem específica para lembrete na thread
+    const reminderPrompt = buildAppointmentReminderPrompt(template, reminderContext, agent);
+    await addMessageToOpenAIThread(apiKey, threadId, reminderPrompt, 'user');
+    
+    // 3. Executar run com modelo direto (sem assistant)
+    const runResult = await executeOpenAIRunWithModel(apiKey, threadId, agent, reminderContext.appointmentId);
+    
+    if (!runResult.success) {
+      throw new Error(`Run com modelo falhou: ${runResult.error}`);
+    }
+    
+    // 4. Obter resposta da thread
+    const assistantMessage = await getLatestAssistantMessage(apiKey, threadId);
+    
+    if (!assistantMessage) {
+      throw new Error('Nenhuma resposta do modelo na thread para lembrete');
+    }
+    
+    // 5. Processar consumo de créditos (se tiver usage)
+    if (runResult.usage?.total_tokens) {
+      await processOpenAICreditsUsage(
+        companyId,
+        runResult.usage.total_tokens,
+        reminderContext.appointmentId || 'appointment-reminder',
+        agent.id,
+        `Lembrete Thread "${agent.name}" - ${runResult.usage.total_tokens} tokens`
+      );
+    }
+    
+    return assistantMessage.trim();
+    
+  } catch (error) {
+    log('error', 'Erro na geração de lembrete com Thread + modelo', { error: error.message });
+    throw error;
+  }
+}
 
-CONTEXTO ATUAL:
-- Contato: ${reminderContext.contactName}
-- Appointment: ${reminderContext.appointmentTitle}
+/**
+ * ✅ NOVO: Constrói prompt específico para lembrete de appointment
+ */
+function buildAppointmentReminderPrompt(template, reminderContext, agent) {
+  const appointmentDate = new Date(reminderContext.appointmentDate);
+  const dataFormatada = appointmentDate.toLocaleDateString('pt-BR');
+  const horarioFormatado = appointmentDate.toLocaleTimeString('pt-BR', { 
+    hour: '2-digit', 
+    minute: '2-digit' 
+  });
+  
+  return `LEMBRETE DE APPOINTMENT AUTOMÁTICO: Você precisa enviar um lembrete personalizado para este appointment.
+
+TEMPLATE ORIGINAL: "${template}"
+
+CONTEXTO DO APPOINTMENT:
+- Nome do contato: ${reminderContext.contactName || 'Cliente'}
+- Título do appointment: ${reminderContext.appointmentTitle || 'Agendamento'}
 - Data: ${dataFormatada}
 - Horário: ${horarioFormatado}
 - Local: ${reminderContext.appointmentLocation || 'Não especificado'}
 - Tipo de lembrete: ${reminderContext.reminderType}
 - Tempo antes: ${reminderContext.minutesBefore} minutos
 
-TEMPLATE ORIGINAL: "${template}"
-
-INSTRUÇÃO: Reescreva o template de forma mais personalizada e amigável. 
+INSTRUÇÃO: Reescreva o template de forma mais personalizada baseada no contexto do appointment. 
 - Seja natural e específico
-- Inclua detalhes do appointment
+- Inclua detalhes relevantes do appointment
 - Mantenha tom ${agent.tone || 'profissional'}
 - Máximo 200 caracteres
-- Não use emojis em excesso
+- Seja direto e útil
 
 Responda APENAS com o lembrete reescrito, sem explicações.`;
+}
 
-    const response = await axios.post('https://api.openai.com/v1/chat/completions', {
-      model: agent.openai_model || 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: 'Gere o lembrete personalizado baseado no template e contexto fornecidos.' }
-      ],
-      temperature: agent.temperature || 0.7,
-      max_tokens: agent.max_tokens || 150
-    }, {
+/**
+ * ✅ NOVO: Obter ou criar thread OpenAI para lembretes (baseado no appointment)
+ */
+async function getOrCreateAppointmentReminderThread(apiKey, appointmentId, agent, reminderContext) {
+  try {
+    // Para lembretes, criar sempre uma nova thread (não precisamos persistir entre lembretes)
+    log('debug', 'Criando nova thread OpenAI para lembrete de appointment');
+    
+    const response = await axios.post('https://api.openai.com/v1/threads', {}, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'OpenAI-Beta': 'assistants=v2'
       },
       timeout: CONFIG.defaultResponseTimeoutMs
     });
-
-    const personalizedMessage = response.data.choices[0]?.message?.content?.trim();
     
-    if (personalizedMessage && response.data.usage?.total_tokens) {
-      await processOpenAICreditsUsage(
-        companyId,
-        response.data.usage.total_tokens,
-        'appointment-reminder',
-        agent.id,
-        `Lembrete Appointment "${agent.name}" - ${response.data.usage.total_tokens} tokens`
-      );
-    }
+    const threadId = response.data.id;
     
-    return personalizedMessage;
+    // Adicionar mensagem de sistema inicial específica para lembretes
+    await addAppointmentReminderSystemMessageToThread(apiKey, threadId, agent, reminderContext);
+    
+    log('success', 'Thread OpenAI para lembrete criada', { threadId, appointmentId });
+    return threadId;
     
   } catch (error) {
-    log('error', 'Erro na geração direta de lembrete', { error: error.message });
-    throw error;
+    log('error', 'Erro ao criar thread OpenAI para lembrete', { error: error.message });
+    return null;
   }
+}
+
+/**
+ * ✅ NOVO: Adicionar mensagem de sistema à thread específica para lembretes
+ */
+async function addAppointmentReminderSystemMessageToThread(apiKey, threadId, agent, reminderContext) {
+  try {
+    const systemPrompt = buildAppointmentReminderSystemPrompt(agent, reminderContext);
+    
+    await axios.post(`https://api.openai.com/v1/threads/${threadId}/messages`, {
+      role: 'system',
+      content: systemPrompt
+    }, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'OpenAI-Beta': 'assistants=v2'
+      },
+      timeout: CONFIG.defaultResponseTimeoutMs
+    });
+    
+    log('debug', 'Mensagem de sistema para lembrete adicionada à thread');
+    
+  } catch (error) {
+    log('error', 'Erro ao adicionar mensagem de sistema para lembrete', { error: error.message });
+  }
+}
+
+/**
+ * ✅ NOVO: Construir prompt de sistema específico para lembretes
+ */
+function buildAppointmentReminderSystemPrompt(agent, reminderContext) {
+  const now = new Date();
+  const currentDateTime = new Intl.DateTimeFormat('pt-BR', {
+    timeZone: 'America/Sao_Paulo',
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  }).format(now);
+
+  const appointmentDate = new Date(reminderContext.appointmentDate);
+  const appointmentDateTime = new Intl.DateTimeFormat('pt-BR', {
+    timeZone: 'America/Sao_Paulo',
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  }).format(appointmentDate);
+
+  return `Você é ${agent.name}, um assistente especializado em lembretes de appointments.
+
+CONTEXTO: Hoje é ${currentDateTime}
+
+SEU PAPEL: Enviar lembretes personalizados e úteis para appointments próximos.
+
+APPOINTMENT ESPECÍFICO:
+- Contato: ${reminderContext.contactName || 'Cliente'}
+- Título: ${reminderContext.appointmentTitle || 'Agendamento'}
+- Data/Hora: ${appointmentDateTime}
+- Local: ${reminderContext.appointmentLocation || 'Local não especificado'}
+- Tipo de lembrete: ${reminderContext.reminderType}
+- Tempo antes: ${reminderContext.minutesBefore} minutos
+
+INSTRUÇÕES ESPECÍFICAS:
+- Personalize mensagens baseadas no contexto do appointment
+- Seja natural e direto
+- Mantenha o tom ${agent.tone || 'profissional'}
+- Inclua informações relevantes (data, hora, local se disponível)
+- Máximo 200 caracteres por mensagem
+- Seja útil e claro
+
+Você está trabalhando no modo LEMBRETE DE APPOINTMENT AUTOMÁTICO.`;
 }
 
 /**
@@ -1503,19 +1723,21 @@ async function processAppointmentReminder(reminder) {
         agentName: agent.name
       });
       
-      const personalizedMessage = await generatePersonalizedAppointmentReminderWithZionicCredits(
-        finalMessage,
-        {
-          contactName: reminder.contact_name || 'Cliente',
-          appointmentTitle: reminder.appointment_title,
-          appointmentDate: reminder.appointment_start_time,
-          appointmentLocation: reminder.appointment_location,
-          reminderType: reminder.reminder_type,
-          minutesBefore: reminder.minutes_before
-        },
-        agent,
-        reminder.company_id
-      );
+             const personalizedMessage = await generatePersonalizedAppointmentReminderWithZionicCredits(
+         finalMessage,
+         {
+           appointmentId: reminder.appointment_id, // ✅ NOVO: ID do appointment para thread
+           contactName: reminder.contact_name || 'Cliente',
+           contactPhone: reminder.contact_phone || '',
+           appointmentTitle: reminder.appointment_title,
+           appointmentDate: reminder.appointment_start_time,
+           appointmentLocation: reminder.appointment_location,
+           reminderType: reminder.reminder_type,
+           minutesBefore: reminder.minutes_before
+         },
+         agent,
+         reminder.company_id
+       );
       
       if (personalizedMessage && personalizedMessage !== finalMessage) {
         finalMessage = personalizedMessage;
@@ -2204,9 +2426,11 @@ async function executeFollowUps() {
     stats.successRate = stats.totalFollowUpsSent / (stats.totalFollowUpsSent + stats.totalErrors) * 100;
     stats.lastExecution = new Date();
     
-    // ✅ NOVO: Adicionar estatísticas de lembretes
-    if (!stats.totalRemindersSent) stats.totalRemindersSent = 0;
-    stats.totalRemindersSent += reminderSuccessful;
+         // ✅ NOVO: Adicionar estatísticas de lembretes
+     if (!stats.totalRemindersSent) stats.totalRemindersSent = 0;
+     if (!stats.totalRemindersCreated) stats.totalRemindersCreated = 0;
+     stats.totalRemindersSent += reminderSuccessful;
+     stats.totalRemindersCreated += createdReminders;
     
     if (followUpFailed > 0 || reminderFailed > 0) {
       stats.totalErrors += (followUpFailed + reminderFailed);
@@ -2260,7 +2484,13 @@ function startStatusEndpoint() {
       uptime: formatDuration(Date.now() - stats.serverStartTime),
       stats: {
         ...stats,
-        nextExecution: 'A cada 1 minuto (máxima precisão)'
+        nextExecution: 'A cada 1 minuto (máxima precisão)',
+        reminders: {
+          totalSent: stats.totalRemindersSent || 0,
+          totalCreated: stats.totalRemindersCreated || 0,
+          enabled: true,
+          mode: 'threads_persistent'
+        }
       },
       features: {
         orphanSync: true,
