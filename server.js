@@ -2,16 +2,18 @@
  * ===============================================
  * ZIONIC FOLLOW-UP SERVER
  * ===============================================
- * Servidor automático para reativação de leads inativos
+ * Servidor automático para reativação de leads inativos e lembretes de appointments
  * 
  * Funcionalidades:
  * - Busca follow-ups pendentes do banco
+ * - Busca lembretes de appointments pendentes
  * - Verifica contexto da conversa
  * - Gera mensagens personalizadas com IA
  * - Envia via WhatsApp (Evolution API)
  * - Registra logs e métricas
  * ✅ CONTROLE AUTOMÁTICO DE CRÉDITOS
  * ✅ SINCRONIZAÇÃO DE ÓRFÃOS
+ * ✅ LEMBRETES DE APPOINTMENTS AUTOMÁTICOS
  * 
  * ENV VARS necessárias:
  * - SUPABASE_URL
@@ -24,7 +26,7 @@
  * Frequência: A cada 1 minuto
  * 
  * @author Zionic Team
- * @version 1.5.0
+ * @version 1.6.0
  */
 
 require('dotenv').config();
@@ -249,6 +251,94 @@ async function getPendingFollowUps() {
   } catch (error) {
     log('error', 'Erro ao buscar follow-ups', { error: error.message });
     return [];
+  }
+}
+
+// ===============================================
+// ✅ NOVO: BUSCAR LEMBRETES DE APPOINTMENTS PENDENTES
+// ===============================================
+
+/**
+ * Busca lembretes de appointments prontos para execução
+ */
+async function getPendingAppointmentReminders() {
+  try {
+    log('info', 'Buscando lembretes de appointments pendentes...');
+    
+    const { data: reminders, error } = await supabase.rpc('get_pending_appointment_reminders', {
+      p_limit: CONFIG.maxFollowUpsPerExecution
+    });
+    
+    if (error) {
+      log('error', 'Erro ao buscar lembretes pendentes', { error: error.message });
+      return [];
+    }
+    
+    const totalPending = reminders?.length || 0;
+    const overdueCount = reminders?.filter(r => r.minutes_overdue > 0).length || 0;
+    
+    log('success', `${totalPending} lembretes de appointments prontos para execução`, {
+      total: totalPending,
+      overdue: overdueCount,
+      onTime: totalPending - overdueCount,
+      method: 'sql_function'
+    });
+    
+    return reminders || [];
+    
+  } catch (error) {
+    log('error', 'Erro ao buscar lembretes de appointments', { error: error.message });
+    return [];
+  }
+}
+
+/**
+ * ✅ NOVO: Cria lembretes automáticos para appointments futuros
+ */
+async function createAppointmentReminders() {
+  try {
+    log('info', 'Criando lembretes automáticos para appointments...');
+    
+    // Buscar empresas ativas
+    const { data: companies, error: companiesError } = await supabase
+      .from('companies')
+      .select('id')
+      .eq('is_active', true);
+    
+    if (companiesError) {
+      log('error', 'Erro ao buscar empresas', { error: companiesError.message });
+      return 0;
+    }
+    
+    let totalCreated = 0;
+    
+    for (const company of companies || []) {
+      try {
+        const { data: created, error } = await supabase.rpc('create_appointment_reminders', {
+          p_company_id: company.id,
+          p_hours_ahead: 48 // Criar lembretes para próximas 48 horas
+        });
+        
+        if (!error && created > 0) {
+          totalCreated += created;
+          log('debug', `${created} lembretes criados para empresa ${company.id}`);
+        }
+      } catch (companyError) {
+        log('warning', `Erro ao criar lembretes para empresa ${company.id}`, { 
+          error: companyError.message 
+        });
+      }
+    }
+    
+    if (totalCreated > 0) {
+      log('success', `${totalCreated} novos lembretes de appointments criados`);
+    }
+    
+    return totalCreated;
+    
+  } catch (error) {
+    log('error', 'Erro ao criar lembretes automáticos', { error: error.message });
+    return 0;
   }
 }
 
@@ -514,6 +604,140 @@ function estimateTokensFromText(text) {
 // ===============================================
 // CORE: GERAÇÃO DE MENSAGEM COM IA (ATUALIZADA)
 // ===============================================
+
+/**
+ * ✅ NOVO: Gera lembrete de appointment personalizado usando Zionic Credits
+ */
+async function generatePersonalizedAppointmentReminderWithZionicCredits(template, reminderContext, agent, companyId) {
+  try {
+    log('info', 'Gerando lembrete de appointment com Zionic Credits', { companyId });
+    
+    const ZIONIC_OPENAI_KEY = process.env.ZIONIC_OPENAI_KEY || process.env.OPENAI_API_KEY;
+    
+    if (!ZIONIC_OPENAI_KEY) {
+      log('error', 'Chave OpenAI do sistema Zionic não configurada');
+      return template;
+    }
+
+    // Verificar créditos Zionic suficientes
+    const creditsCheck = await checkCreditsBalance(companyId, 200);
+    if (!creditsCheck.hasEnough) {
+      log('warning', 'Créditos Zionic insuficientes para personalizar lembrete', {
+        companyId,
+        currentBalance: creditsCheck.currentBalance,
+        required: 200
+      });
+      
+      await notifyZionicCreditsInsufficient(companyId, creditsCheck.currentBalance, 200);
+      return template;
+    }
+
+    // Usar geração direta para lembretes (mais simples que threads)
+    const personalizedMessage = await generateAppointmentReminderDirectly(
+      ZIONIC_OPENAI_KEY,
+      agent,
+      template,
+      reminderContext,
+      companyId
+    );
+    
+    if (!personalizedMessage) {
+      log('warning', 'IA Zionic não gerou lembrete personalizado, usando template original');
+      return template;
+    }
+    
+    log('success', 'Lembrete personalizado com Zionic Credits', { 
+      originalLength: template.length,
+      generatedLength: personalizedMessage.length,
+      mode: 'direct_appointment_reminder'
+    });
+    
+    return personalizedMessage;
+    
+  } catch (error) {
+    log('error', 'Erro ao gerar lembrete personalizado com Zionic Credits', { 
+      error: error.message, 
+      companyId 
+    });
+    
+    await notifyOpenAIError(companyId, { 
+      status: error.response?.status,
+      message: error.message 
+    }, 'appointment_reminder');
+    
+    return template;
+  }
+}
+
+/**
+ * ✅ NOVO: Gera lembrete diretamente sem threads (mais eficiente para lembretes)
+ */
+async function generateAppointmentReminderDirectly(apiKey, agent, template, reminderContext, companyId) {
+  try {
+    const appointmentDate = new Date(reminderContext.appointmentDate);
+    const dataFormatada = appointmentDate.toLocaleDateString('pt-BR');
+    const horarioFormatado = appointmentDate.toLocaleTimeString('pt-BR', { 
+      hour: '2-digit', 
+      minute: '2-digit' 
+    });
+    
+    const systemPrompt = `Você é ${agent.name}, um assistente especializado em lembretes de appointments.
+
+CONTEXTO ATUAL:
+- Contato: ${reminderContext.contactName}
+- Appointment: ${reminderContext.appointmentTitle}
+- Data: ${dataFormatada}
+- Horário: ${horarioFormatado}
+- Local: ${reminderContext.appointmentLocation || 'Não especificado'}
+- Tipo de lembrete: ${reminderContext.reminderType}
+- Tempo antes: ${reminderContext.minutesBefore} minutos
+
+TEMPLATE ORIGINAL: "${template}"
+
+INSTRUÇÃO: Reescreva o template de forma mais personalizada e amigável. 
+- Seja natural e específico
+- Inclua detalhes do appointment
+- Mantenha tom ${agent.tone || 'profissional'}
+- Máximo 200 caracteres
+- Não use emojis em excesso
+
+Responda APENAS com o lembrete reescrito, sem explicações.`;
+
+    const response = await axios.post('https://api.openai.com/v1/chat/completions', {
+      model: agent.openai_model || 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: 'Gere o lembrete personalizado baseado no template e contexto fornecidos.' }
+      ],
+      temperature: agent.temperature || 0.7,
+      max_tokens: agent.max_tokens || 150
+    }, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: CONFIG.defaultResponseTimeoutMs
+    });
+
+    const personalizedMessage = response.data.choices[0]?.message?.content?.trim();
+    
+    if (personalizedMessage && response.data.usage?.total_tokens) {
+      await processOpenAICreditsUsage(
+        companyId,
+        response.data.usage.total_tokens,
+        'appointment-reminder',
+        agent.id,
+        `Lembrete Appointment "${agent.name}" - ${response.data.usage.total_tokens} tokens`
+      );
+    }
+    
+    return personalizedMessage;
+    
+  } catch (error) {
+    log('error', 'Erro na geração direta de lembrete', { error: error.message });
+    throw error;
+  }
+}
 
 /**
  * ✅ CORRIGIDO: Gera mensagem usando Zionic Credits com THREADS PERSISTENTES
@@ -1153,8 +1377,246 @@ async function sendWhatsAppMessage(instanceName, recipientNumber, message) {
 }
 
 // ===============================================
-// CORE: PROCESSAR FOLLOW-UP
+// CORE: PROCESSAR FOLLOW-UP E LEMBRETES
 // ===============================================
+
+/**
+ * ✅ NOVO: Processa um único lembrete de appointment
+ */
+async function processAppointmentReminder(reminder) {
+  const startTime = Date.now();
+  let executionLog = {
+    reminder_queue_id: reminder.id,
+    appointment_id: reminder.appointment_id,
+    agent_id: reminder.agent_id,
+    company_id: reminder.company_id,
+    rule_name: reminder.rule_name,
+    success: false,
+    error_message: null,
+    response_time_ms: 0,
+    message_sent: '',
+    reminder_sent: false
+  };
+  
+  try {
+    log('info', `Processando lembrete de appointment: ${reminder.rule_name}`, { 
+      reminderId: reminder.id,
+      companyId: reminder.company_id,
+      appointmentId: reminder.appointment_id,
+      reminderType: reminder.reminder_type,
+      minutesBefore: reminder.minutes_before
+    });
+    
+    // ✅ Verificar se lembrete ainda está pendente
+    const { data: currentStatus, error: statusError } = await supabase
+      .from('appointment_reminder_queue')
+      .select('status, attempts')
+      .eq('id', reminder.id)
+      .single();
+    
+    if (statusError || !currentStatus) {
+      throw new Error('Lembrete não encontrado ou já foi removido');
+    }
+    
+    if (currentStatus.status !== 'pending') {
+      log('warning', 'Lembrete não está mais pendente, pulando', { 
+        reminderId: reminder.id,
+        currentStatus: currentStatus.status
+      });
+      return { success: true, skipped: true, reason: 'status_changed' };
+    }
+    
+    // ✅ Verificar se ainda pode tentar
+    if (currentStatus.attempts >= reminder.max_attempts) {
+      log('warning', 'Lembrete já atingiu máximo de tentativas', { 
+        reminderId: reminder.id,
+        currentAttempts: currentStatus.attempts,
+        maxAttempts: reminder.max_attempts
+      });
+      
+      await supabase
+        .from('appointment_reminder_queue')
+        .update({ 
+          status: 'failed',
+          execution_error: `Máximo de ${reminder.max_attempts} tentativas atingido`
+        })
+        .eq('id', reminder.id);
+        
+      return { success: false, error: 'Max attempts reached' };
+    }
+    
+    // ✅ Verificar créditos da empresa
+    const creditsCheck = await checkCreditsBalance(reminder.company_id, CONFIG.credits.minimumBalanceThreshold);
+    if (!creditsCheck.hasEnough) {
+      await supabase
+        .from('appointment_reminder_queue')
+        .update({ 
+          status: 'failed',
+          attempts: reminder.attempts + 1,
+          execution_error: `Créditos insuficientes (${creditsCheck.currentBalance}/${CONFIG.credits.minimumBalanceThreshold})`
+        })
+        .eq('id', reminder.id);
+        
+      throw new Error(`Créditos insuficientes (${creditsCheck.currentBalance}/${CONFIG.credits.minimumBalanceThreshold})`);
+    }
+    
+    // ✅ Buscar dados do agente
+    const { data: agent, error: agentError } = await supabase
+      .from('ai_agents')
+      .select('*')
+      .eq('id', reminder.agent_id)
+      .single();
+      
+    if (agentError || !agent) {
+      throw new Error(`Agente não encontrado: ${agentError?.message}`);
+    }
+    
+    // ✅ Preparar mensagem do lembrete
+    let finalMessage = reminder.message_template;
+    
+    // Substituir variáveis na mensagem
+    if (reminder.contact_name) {
+      finalMessage = finalMessage.replace(/{nome}/g, reminder.contact_name);
+    }
+    if (reminder.appointment_title) {
+      finalMessage = finalMessage.replace(/{appointment_title}/g, reminder.appointment_title);
+    }
+    if (reminder.appointment_start_time) {
+      const appointmentDate = new Date(reminder.appointment_start_time);
+      const dataFormatada = appointmentDate.toLocaleDateString('pt-BR');
+      const horarioFormatado = appointmentDate.toLocaleTimeString('pt-BR', { 
+        hour: '2-digit', 
+        minute: '2-digit' 
+      });
+      
+      finalMessage = finalMessage.replace(/{data}/g, dataFormatada);
+      finalMessage = finalMessage.replace(/{horario}/g, horarioFormatado);
+    }
+    if (reminder.appointment_location) {
+      finalMessage = finalMessage.replace(/{local}/g, reminder.appointment_location);
+    }
+    
+    // ✅ Personalizar com IA se possível
+    try {
+      log('info', 'Personalizando lembrete com IA usando master key', { 
+        companyId: reminder.company_id,
+        agentName: agent.name
+      });
+      
+      const personalizedMessage = await generatePersonalizedAppointmentReminderWithZionicCredits(
+        finalMessage,
+        {
+          contactName: reminder.contact_name || 'Cliente',
+          appointmentTitle: reminder.appointment_title,
+          appointmentDate: reminder.appointment_start_time,
+          appointmentLocation: reminder.appointment_location,
+          reminderType: reminder.reminder_type,
+          minutesBefore: reminder.minutes_before
+        },
+        agent,
+        reminder.company_id
+      );
+      
+      if (personalizedMessage && personalizedMessage !== finalMessage) {
+        finalMessage = personalizedMessage;
+        log('debug', 'Lembrete personalizado com sucesso via master key');
+      }
+    } catch (aiError) {
+      log('warning', 'Erro ao personalizar lembrete com IA, usando template', { 
+        error: aiError.message 
+      });
+    }
+    
+    executionLog.message_sent = finalMessage;
+    
+    // ✅ Buscar instância WhatsApp
+    const { data: instance, error: instanceError } = await supabase
+      .from('whatsapp_instances')
+      .select('name')
+      .eq('company_id', reminder.company_id)
+      .eq('status', 'connected')
+      .single();
+    
+    if (instanceError || !instance?.name) {
+      throw new Error('Instância WhatsApp ativa não encontrada');
+    }
+    
+    // ✅ Enviar mensagem via WhatsApp
+    const sendResult = await sendWhatsAppMessage(
+      instance.name,
+      reminder.contact_phone,
+      finalMessage
+    );
+    
+    if (!sendResult.success) {
+      throw new Error(sendResult.error);
+    }
+    
+    // ✅ Marcar como enviado
+    const { error: updateError } = await supabase
+      .from('appointment_reminder_queue')
+      .update({ 
+        status: 'sent',
+        attempts: reminder.attempts + 1,
+        executed_at: new Date().toISOString(),
+        ai_generated_message: finalMessage
+      })
+      .eq('id', reminder.id);
+    
+    if (updateError) {
+      throw new Error(`Erro ao marcar como sent: ${updateError.message}`);
+    }
+    
+    executionLog.success = true;
+    executionLog.reminder_sent = true;
+    executionLog.response_time_ms = Date.now() - startTime;
+    
+    log('success', `Lembrete de appointment enviado com sucesso`, {
+      reminderId: reminder.id,
+      ruleName: reminder.rule_name,
+      contactName: reminder.contact_name,
+      appointmentTitle: reminder.appointment_title,
+      responseTime: formatDuration(executionLog.response_time_ms)
+    });
+    
+    return { success: true, messageId: sendResult.messageId };
+    
+  } catch (error) {
+    executionLog.error_message = error.message;
+    executionLog.response_time_ms = Date.now() - startTime;
+    
+    // Atualizar tentativas
+    const newAttempts = reminder.attempts + 1;
+    const status = newAttempts >= reminder.max_attempts ? 'failed' : 'pending';
+    
+    await supabase
+      .from('appointment_reminder_queue')
+      .update({ 
+        attempts: newAttempts,
+        status: status,
+        execution_error: error.message
+      })
+      .eq('id', reminder.id);
+    
+    log('error', `Erro ao processar lembrete de appointment`, {
+      reminderId: reminder.id,
+      error: error.message,
+      attempts: newAttempts,
+      maxAttempts: reminder.max_attempts,
+      finalStatus: status
+    });
+    
+    return { success: false, error: error.message };
+    
+  } finally {
+    // Registrar log de execução
+    try {
+      await supabase.from('appointment_reminder_logs').insert(executionLog);
+    } catch (logError) {
+      log('warning', 'Erro ao registrar log de lembrete', { error: logError.message });
+    }
+  }
+}
 
 /**
  * Processa um único follow-up
@@ -1671,13 +2133,13 @@ async function findAndCreateOrphanedFollowUps() {
 // ===============================================
 
 /**
- * Execução principal do processamento de follow-ups
+ * Execução principal do processamento de follow-ups e lembretes
  */
 async function executeFollowUps() {
   const executionStart = Date.now();
   stats.totalExecutions++;
   
-  log('info', '🔄 === INICIANDO EXECUÇÃO DE FOLLOW-UPS ===', {
+  log('info', '🔄 === INICIANDO EXECUÇÃO DE FOLLOW-UPS E LEMBRETES ===', {
     execution: stats.totalExecutions,
     timestamp: new Date().toISOString()
   });
@@ -1686,52 +2148,88 @@ async function executeFollowUps() {
     // 1. Buscar follow-ups pendentes existentes
     const pendingFollowUps = await getPendingFollowUps();
     
-    // ✅ 2. NOVO: Buscar e criar follow-ups órfãos
+    // 2. Buscar e criar follow-ups órfãos
     const orphanedFollowUps = await findAndCreateOrphanedFollowUps();
     
-    // 3. Combinar ambos os tipos
-    const allFollowUps = [...pendingFollowUps, ...orphanedFollowUps];
+    // ✅ 3. NOVO: Buscar lembretes de appointments pendentes
+    const pendingReminders = await getPendingAppointmentReminders();
     
-    if (allFollowUps.length === 0) {
-      log('info', 'Nenhum follow-up para processar');
+    // ✅ 4. NOVO: Criar lembretes automáticos (executa periodicamente)
+    const createdReminders = await createAppointmentReminders();
+    
+    // 5. Combinar todos os tipos
+    const allFollowUps = [...pendingFollowUps, ...orphanedFollowUps];
+    const allReminders = pendingReminders;
+    
+    if (allFollowUps.length === 0 && allReminders.length === 0) {
+      log('info', 'Nenhum follow-up ou lembrete para processar');
+      if (createdReminders > 0) {
+        log('info', `${createdReminders} novos lembretes criados para execução futura`);
+      }
       return;
     }
     
-    log('info', `Processando ${allFollowUps.length} follow-ups (${pendingFollowUps.length} pendentes + ${orphanedFollowUps.length} órfãos)...`);
+    log('info', `Processando ${allFollowUps.length} follow-ups (${pendingFollowUps.length} pendentes + ${orphanedFollowUps.length} órfãos) e ${allReminders.length} lembretes...`);
     
-    // 4. Processar cada follow-up
-    const results = [];
+    // 6. Processar follow-ups
+    const followUpResults = [];
     for (const followUp of allFollowUps) {
       const result = await processFollowUp(followUp);
-      results.push(result);
+      followUpResults.push(result);
       
-      // Pausa entre execuções para não sobrecarregar
+      // Pausa entre execuções
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
     
-    // 5. Calcular estatísticas
-    const successful = results.filter(r => r.success && !r.deferred).length;
-    const deferred = results.filter(r => r.deferred).length;
-    const failed = results.filter(r => !r.success).length;
+    // ✅ 7. NOVO: Processar lembretes de appointments
+    const reminderResults = [];
+    for (const reminder of allReminders) {
+      const result = await processAppointmentReminder(reminder);
+      reminderResults.push(result);
+      
+      // Pausa entre execuções
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
     
-    stats.totalFollowUpsSent += successful;
-    stats.totalOrphansCreated += orphanedFollowUps.length; // ✅ NOVO: Contar órfãos criados
+    // 8. Calcular estatísticas combinadas
+    const followUpSuccessful = followUpResults.filter(r => r.success && !r.deferred).length;
+    const followUpDeferred = followUpResults.filter(r => r.deferred).length;
+    const followUpFailed = followUpResults.filter(r => !r.success).length;
+    
+    const reminderSuccessful = reminderResults.filter(r => r.success && !r.skipped).length;
+    const reminderFailed = reminderResults.filter(r => !r.success).length;
+    
+    stats.totalFollowUpsSent += followUpSuccessful;
+    stats.totalOrphansCreated += orphanedFollowUps.length;
     stats.successRate = stats.totalFollowUpsSent / (stats.totalFollowUpsSent + stats.totalErrors) * 100;
     stats.lastExecution = new Date();
     
-    if (failed > 0) {
-      stats.totalErrors += failed;
+    // ✅ NOVO: Adicionar estatísticas de lembretes
+    if (!stats.totalRemindersSent) stats.totalRemindersSent = 0;
+    stats.totalRemindersSent += reminderSuccessful;
+    
+    if (followUpFailed > 0 || reminderFailed > 0) {
+      stats.totalErrors += (followUpFailed + reminderFailed);
     }
     
     const executionTime = Date.now() - executionStart;
     
     log('success', '✅ === EXECUÇÃO CONCLUÍDA ===', {
-      totalProcessed: allFollowUps.length,
+      // Follow-ups
+      totalFollowUpsProcessed: allFollowUps.length,
       pendingProcessed: pendingFollowUps.length,
       orphansCreated: orphanedFollowUps.length,
-      successful,
-      deferred,
-      failed,
+      followUpSuccessful,
+      followUpDeferred,
+      followUpFailed,
+      
+      // Lembretes
+      totalRemindersProcessed: allReminders.length,
+      reminderSuccessful,
+      reminderFailed,
+      remindersCreated: createdReminders,
+      
+      // Geral
       executionTime: formatDuration(executionTime),
       successRate: `${stats.successRate.toFixed(1)}%`
     });
@@ -1757,8 +2255,8 @@ function startStatusEndpoint() {
   app.get('/', (req, res) => {
     res.json({
       status: 'running',
-      service: 'Zionic Follow-up Server',
-      version: '1.6.4', // ✅ RESPEITO À PAUSA: Servidor agora respeita follow-ups pausados pelo usuário
+      service: 'Zionic Follow-up & Appointment Reminders Server',
+      version: '1.7.0', // ✅ NOVO: Sistema completo de lembretes de appointments
       uptime: formatDuration(Date.now() - stats.serverStartTime),
       stats: {
         ...stats,
@@ -1767,15 +2265,19 @@ function startStatusEndpoint() {
       features: {
         orphanSync: true,
         creditsControl: true,
-        intelligentFallback: true, // ✅ NOVO: Fallback inteligente OpenAI
-        systemNotifications: true, // ✅ NOVO: Notificações automáticas
-        loopPrevention: true, // ✅ NOVO: Prevenção de loop infinito
-        persistentThreads: true, // ✅ NOVO: Threads persistentes OpenAI
-        masterKeyOnly: true, // ✅ NOVO: Apenas master key (sem chave própria)
+        intelligentFallback: true,
+        systemNotifications: true,
+        loopPrevention: true,
+        persistentThreads: true,
+        masterKeyOnly: true,
+        appointmentReminders: true, // ✅ NOVO: Lembretes de appointments
         intervalMinutes: CONFIG.executionIntervalMinutes
       },
       fixes: {
-        v164: 'RESPEITO À PAUSA: Servidor agora respeita follow-ups pausados pelo usuário',
+        v170: 'LEMBRETES DE APPOINTMENTS: Sistema completo de lembretes automáticos integrado',
+        appointmentReminders: 'Lembretes personalizados com IA para appointments próximos',
+        multipleReminderTypes: 'Suporte a lembretes antes, confirmação e follow-up pós no-show',
+        creditsIntegration: 'Lembretes usam Zionic Credits para personalização com IA',
         pauseRespect: 'Verificação de conversations.metadata.follow_up_paused antes do processamento',
         conversationPauseDetection: 'Follow-ups cancelados automaticamente se conversa pausada',
         triggerLoopFix: 'Trigger ignora mensagens enviadas pelo follow-up server',
