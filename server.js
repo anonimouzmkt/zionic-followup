@@ -100,6 +100,13 @@ async function generatePersonalizedMessage(messageTemplate, context, agent, comp
     });
 
     // ✅ 1. Buscar chave OpenAI (master key sempre, conforme memória do usuário)
+    log('debug', 'Verificando configuração das chaves OpenAI', {
+      hasMasterKey: !!CONFIG.masterOpenAIKey,
+      hasFallbackKey: !!CONFIG.fallbackOpenAIKey,
+      masterKeyPrefix: CONFIG.masterOpenAIKey ? CONFIG.masterOpenAIKey.substring(0, 7) + '...' : 'null',
+      fallbackKeyPrefix: CONFIG.fallbackOpenAIKey ? CONFIG.fallbackOpenAIKey.substring(0, 7) + '...' : 'null'
+    });
+
     let openaiApiKey = CONFIG.masterOpenAIKey;
     
     if (!openaiApiKey) {
@@ -112,12 +119,33 @@ async function generatePersonalizedMessage(messageTemplate, context, agent, comp
       return messageTemplate;
     }
 
+    log('debug', 'Chave OpenAI selecionada', {
+      keyPrefix: openaiApiKey.substring(0, 7) + '...',
+      keyLength: openaiApiKey.length,
+      isValidFormat: openaiApiKey.startsWith('sk-')
+    });
+
     // ✅ 2. Para follow-ups, SEMPRE usar thread existente da conversa
     if (context.conversation && !context.appointmentId) {
       const threadId = context.conversation.openai_thread_id;
       
+      log('debug', 'Verificando thread da conversa', {
+        hasThread: !!threadId,
+        threadId: threadId,
+        conversationId: context.conversation.id,
+        threadFormat: threadId ? (threadId.startsWith('thread_') ? 'valid' : 'invalid') : 'none'
+      });
+      
       if (!threadId) {
         log('warning', 'Conversa sem thread OpenAI - usando template simples para preservar contexto');
+        return messageTemplate;
+      }
+      
+      if (!threadId.startsWith('thread_')) {
+        log('error', 'Thread ID em formato inválido', { 
+          threadId: threadId,
+          conversationId: context.conversation.id
+        });
         return messageTemplate;
       }
       
@@ -126,7 +154,32 @@ async function generatePersonalizedMessage(messageTemplate, context, agent, comp
         conversationId: context.conversation.id
       });
       
-      // ✅ 3. Tentar gerar resposta personalizada usando thread existente
+      // ✅ 3. Verificar se thread ainda existe no OpenAI
+      try {
+        log('debug', 'Verificando se thread existe no OpenAI', { threadId });
+        
+        const threadCheckResponse = await axios.get(`https://api.openai.com/v1/threads/${threadId}`, {
+          headers: {
+            'Authorization': `Bearer ${openaiApiKey}`,
+            'OpenAI-Beta': 'assistants=v2'
+          }
+        });
+
+        log('success', 'Thread verificada e existe no OpenAI', { 
+          threadId,
+          status: threadCheckResponse.status 
+        });
+      } catch (threadCheckError) {
+        log('error', 'Thread não existe ou é inválida no OpenAI', {
+          threadId,
+          error: threadCheckError.message,
+          status: threadCheckError.response?.status,
+          data: threadCheckError.response?.data
+        });
+        return messageTemplate;
+      }
+
+      // ✅ 4. Tentar gerar resposta personalizada usando thread existente
       try {
         return await generateWithExistingThread(
           messageTemplate, 
@@ -144,7 +197,7 @@ async function generatePersonalizedMessage(messageTemplate, context, agent, comp
       }
     }
     
-    // ✅ 4. Para appointments ou outros casos, usar geração simples
+         // ✅ 5. Para appointments ou outros casos, usar geração simples
     try {
       return await generateWithDirectAPI(
         messageTemplate,
@@ -205,21 +258,43 @@ INSTRUÇÕES:
 Gere apenas a mensagem final personalizada, sem explicações.`;
 
   // ✅ Adicionar mensagem à thread existente
-  await axios.post(`https://api.openai.com/v1/threads/${threadId}/messages`, {
-    role: 'user',
-    content: contextualPrompt,
-    metadata: {
-      type: 'follow_up_request',
-      template_length: messageTemplate.length,
-      created_at: new Date().toISOString()
-    }
-  }, {
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${openaiApiKey}`,
-      'OpenAI-Beta': 'assistants=v2'
-    }
-  });
+  try {
+    log('debug', 'Tentando adicionar mensagem à thread', {
+      threadId: threadId,
+      hasApiKey: !!openaiApiKey,
+      apiKeyPrefix: openaiApiKey ? openaiApiKey.substring(0, 7) + '...' : 'null',
+      promptLength: contextualPrompt.length
+    });
+
+    await axios.post(`https://api.openai.com/v1/threads/${threadId}/messages`, {
+      role: 'user',
+      content: contextualPrompt,
+      metadata: {
+        type: 'follow_up_request',
+        template_length: messageTemplate.length,
+        created_at: new Date().toISOString()
+      }
+    }, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${openaiApiKey}`,
+        'OpenAI-Beta': 'assistants=v2'
+      }
+    });
+
+    log('success', 'Mensagem adicionada à thread com sucesso');
+  } catch (addMessageError) {
+    log('error', 'ERRO DETALHADO ao adicionar mensagem à thread', {
+      error: addMessageError.message,
+      status: addMessageError.response?.status,
+      statusText: addMessageError.response?.statusText,
+      data: addMessageError.response?.data,
+      headers: addMessageError.response?.headers,
+      threadId: threadId,
+      hasApiKey: !!openaiApiKey
+    });
+    throw addMessageError;
+  }
 
   // ✅ Se agente tem assistant, usar Assistant API
   if (agent.openai_assistant_id && agent.openai_assistant_id.startsWith('asst_')) {
@@ -234,22 +309,44 @@ Gere apenas a mensagem final personalizada, sem explicações.`;
  * ✅ NOVO: Executar Assistant API
  */
 async function executeAssistantRun(threadId, agent, openaiApiKey) {
-  // Criar run
-  const runResponse = await axios.post(`https://api.openai.com/v1/threads/${threadId}/runs`, {
-    assistant_id: agent.openai_assistant_id,
-    temperature: agent.temperature || 0.7,
-    max_tokens: 150, // Limite para follow-ups
-    metadata: {
-      type: 'follow_up_generation',
-      agent_id: agent.id
-    }
-  }, {
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${openaiApiKey}`,
-      'OpenAI-Beta': 'assistants=v2'
-    }
-  });
+  try {
+    log('debug', 'Iniciando execução do Assistant', {
+      threadId: threadId,
+      assistantId: agent.openai_assistant_id,
+      agentId: agent.id,
+      hasApiKey: !!openaiApiKey
+    });
+
+    // Criar run
+    const runResponse = await axios.post(`https://api.openai.com/v1/threads/${threadId}/runs`, {
+      assistant_id: agent.openai_assistant_id,
+      temperature: agent.temperature || 0.7,
+      max_tokens: 150, // Limite para follow-ups
+      metadata: {
+        type: 'follow_up_generation',
+        agent_id: agent.id
+      }
+    }, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${openaiApiKey}`,
+        'OpenAI-Beta': 'assistants=v2'
+      }
+    });
+
+    log('success', 'Run criado com sucesso', { runId: runResponse.data.id });
+  } catch (runError) {
+    log('error', 'ERRO DETALHADO ao criar Assistant Run', {
+      error: runError.message,
+      status: runError.response?.status,
+      statusText: runError.response?.statusText,
+      data: runError.response?.data,
+      threadId: threadId,
+      assistantId: agent.openai_assistant_id,
+      hasApiKey: !!openaiApiKey
+    });
+    throw runError;
+  }
 
   let run = runResponse.data;
   let attempts = 0;
@@ -294,44 +391,78 @@ async function executeAssistantRun(threadId, agent, openaiApiKey) {
  * ✅ NOVO: Geração direta via Completion API
  */
 async function executeDirectCompletion(prompt, agent, openaiApiKey) {
-  const completion = await axios.post('https://api.openai.com/v1/chat/completions', {
-    model: agent.openai_model || 'gpt-4',
-    messages: [
-      {
-        role: 'system',
-        content: `Você é ${agent.name}. Você é especialista em follow-ups de reativação de leads. Seja natural, breve e contextual.`
-      },
-      {
-        role: 'user',
-        content: prompt
+  try {
+    log('debug', 'Iniciando completion direta', {
+      model: agent.openai_model || 'gpt-4',
+      agentId: agent.id,
+      agentName: agent.name,
+      hasApiKey: !!openaiApiKey,
+      promptLength: prompt.length
+    });
+
+    const completion = await axios.post('https://api.openai.com/v1/chat/completions', {
+      model: agent.openai_model || 'gpt-4',
+      messages: [
+        {
+          role: 'system',
+          content: `Você é ${agent.name}. Você é especialista em follow-ups de reativação de leads. Seja natural, breve e contextual.`
+        },
+        {
+          role: 'user',
+          content: prompt
+        }
+      ],
+      temperature: agent.temperature || 0.7,
+      max_tokens: 150
+    }, {
+      headers: {
+        'Authorization': `Bearer ${openaiApiKey}`,
+        'Content-Type': 'application/json'
       }
-    ],
-    temperature: agent.temperature || 0.7,
-    max_tokens: 150
-  }, {
-    headers: {
-      'Authorization': `Bearer ${openaiApiKey}`,
-      'Content-Type': 'application/json'
+    });
+
+    const response = completion.data.choices[0]?.message?.content?.trim();
+    if (!response) {
+      throw new Error('Nenhuma resposta da OpenAI Completion');
     }
-  });
 
-  const response = completion.data.choices[0]?.message?.content?.trim();
-  if (!response) {
-    throw new Error('Nenhuma resposta da OpenAI Completion');
+    log('success', 'Completion executada com sucesso', {
+      responseLength: response.length,
+      model: agent.openai_model || 'gpt-4'
+    });
+
+    return response;
+  } catch (completionError) {
+    log('error', 'ERRO DETALHADO na completion direta', {
+      error: completionError.message,
+      status: completionError.response?.status,
+      statusText: completionError.response?.statusText,
+      data: completionError.response?.data,
+      model: agent.openai_model || 'gpt-4',
+      agentId: agent.id,
+      hasApiKey: !!openaiApiKey
+    });
+    throw completionError;
   }
-
-  return response;
 }
 
 /**
  * ✅ NOVO: Geração para appointments ou casos sem thread
  */
 async function generateWithDirectAPI(messageTemplate, context, agent, openaiApiKey) {
-  let prompt;
-  
-  if (context.appointmentId) {
-    // Para lembretes de appointment
-    prompt = `Personalize este lembrete de appointment de forma natural:
+  try {
+    log('debug', 'Iniciando geração direta (appointments ou sem thread)', {
+      hasAppointment: !!context.appointmentId,
+      hasContact: !!context.contact,
+      agentId: agent.id,
+      templateLength: messageTemplate.length
+    });
+
+    let prompt;
+    
+    if (context.appointmentId) {
+      // Para lembretes de appointment
+      prompt = `Personalize este lembrete de appointment de forma natural:
 
 TEMPLATE: "${messageTemplate}"
 
@@ -343,9 +474,9 @@ DADOS DO APPOINTMENT:
 - Tipo: ${context.reminderType || 'Lembrete'}
 
 Gere uma versão natural e cordial do lembrete. Seja breve e claro.`;
-  } else {
-    // Para follow-ups sem thread
-    prompt = `Personalize esta mensagem de follow-up:
+    } else {
+      // Para follow-ups sem thread
+      prompt = `Personalize esta mensagem de follow-up:
 
 TEMPLATE: "${messageTemplate}"
 
@@ -354,9 +485,22 @@ CONTEXTO:
 - Empresa: ${context.contact?.company_name || 'Não informado'}
 
 Gere uma versão personalizada e natural. Seja breve (máximo 150 caracteres).`;
-  }
+    }
 
-  return await executeDirectCompletion(prompt, agent, openaiApiKey);
+    log('debug', 'Prompt construído para geração direta', {
+      promptLength: prompt.length,
+      isAppointment: !!context.appointmentId
+    });
+
+    return await executeDirectCompletion(prompt, agent, openaiApiKey);
+  } catch (directError) {
+    log('error', 'ERRO na geração direta (appointments ou sem thread)', {
+      error: directError.message,
+      hasAppointment: !!context.appointmentId,
+      agentId: agent.id
+    });
+    throw directError;
+  }
 }
 
 // ✅ Funções antigas removidas - agora usando lógica do ChatSidebar.tsx
