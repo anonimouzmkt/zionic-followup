@@ -176,9 +176,10 @@ async function getOrCreateThread(context, agent, companyId) {
       return response.data.id;
     }
     
-    // Para follow-ups, buscar thread existente da conversa
+    // Para follow-ups, SEMPRE buscar thread existente da conversa
     if (context.conversation) {
-      const existingThreadId = context.conversation.metadata?.openai_thread_id;
+      // ✅ BUSCAR thread_id da coluna openai_thread_id da conversa
+      const existingThreadId = context.conversation.openai_thread_id;
       
       if (existingThreadId) {
         log('debug', 'Reutilizando thread existente para follow-up', {
@@ -188,31 +189,32 @@ async function getOrCreateThread(context, agent, companyId) {
         return existingThreadId;
       }
       
-      // Criar nova thread para a conversa
-      log('debug', 'Criando nova thread para follow-up', {
+      // ⚠️ Se não tem thread, é porque nunca foi criada - BUSCAR no banco novamente
+      log('warning', 'Thread não encontrada na conversa, buscando no banco', {
         conversationId: context.conversation.id
       });
       
-      const response = await axios.post('https://api.openai.com/v1/threads', {}, {
-        headers: {
-          'Authorization': `Bearer ${openaiKey}`,
-          'Content-Type': 'application/json',
-          'OpenAI-Beta': 'assistants=v2'
-        }
+      const { data: conversationData, error } = await supabase
+        .from('conversations')
+        .select('openai_thread_id')
+        .eq('id', context.conversation.id)
+        .single();
+        
+      if (!error && conversationData?.openai_thread_id) {
+        log('debug', 'Thread encontrada no banco para follow-up', {
+          threadId: conversationData.openai_thread_id,
+          conversationId: context.conversation.id
+        });
+        return conversationData.openai_thread_id;
+      }
+      
+      // ❌ SÓ CRIAR NOVA se realmente não existir - PRESERVAR CONTEXTO
+      log('error', 'ATENÇÃO: Conversa sem thread OpenAI - isso vai perder contexto!', {
+        conversationId: context.conversation.id,
+        action: 'should_create_thread_manually'
       });
       
-      // Salvar thread ID na conversa
-      await supabase
-        .from('conversations')
-        .update({
-          metadata: {
-            ...context.conversation.metadata,
-            openai_thread_id: response.data.id
-          }
-        })
-        .eq('id', context.conversation.id);
-      
-      return response.data.id;
+      return null; // Não criar automaticamente - preservar contexto
     }
     
     return null;
