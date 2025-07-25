@@ -338,7 +338,7 @@ async function processAppointmentReminder(supabase, config, reminder, generatePe
     
     executionLog.message_sent = finalMessage;
     
-    // ✅ Buscar instância WhatsApp
+    // ✅ Buscar instância WhatsApp (opcional - sistema interno como fallback)
     const { data: instance, error: instanceError } = await supabase
       .from('whatsapp_instances')
       .select('name')
@@ -346,16 +346,25 @@ async function processAppointmentReminder(supabase, config, reminder, generatePe
       .eq('status', 'connected')
       .single();
     
+    const instanceName = instance?.name || 'internal_system';
+    
     if (instanceError || !instance?.name) {
-      throw new Error('Instância WhatsApp ativa não encontrada');
+      logReminder('debug', 'WhatsApp instance não encontrada, usando sistema interno', {
+        reminderId: reminder.id,
+        ruleName: reminder.rule_name,
+        companyId: reminder.company_id,
+        appointmentTitle: reminder.appointment_title,
+        error: instanceError?.message
+      });
     }
     
-    logReminder('debug', 'Instância WhatsApp encontrada para lembrete', {
+    logReminder('debug', 'Instância para lembrete definida', {
       reminderId: reminder.id,
       ruleName: reminder.rule_name,
-      instanceName: instance.name,
+      instanceName: instanceName,
       companyId: reminder.company_id,
-      appointmentTitle: reminder.appointment_title
+      appointmentTitle: reminder.appointment_title,
+      type: instance?.name ? 'whatsapp' : 'internal'
     });
     
     // ✅ Enviar mensagem via WhatsApp
@@ -368,13 +377,13 @@ async function processAppointmentReminder(supabase, config, reminder, generatePe
       appointmentTitle: reminder.appointment_title,
       appointmentDate: dataFormatada,
       appointmentTime: horarioFormatado,
-      instanceName: instance.name,
+      instanceName: instanceName,
       messageLength: finalMessage.length,
       minutesBeforeAppointment: reminder.minutes_before
     });
     
     const sendResult = await sendWhatsAppMessage(
-      instance.name,
+      instanceName,
       reminder.contact_phone,
       finalMessage
     );
@@ -428,7 +437,7 @@ async function processAppointmentReminder(supabase, config, reminder, generatePe
       appointmentTime: horarioFormatado,
       appointmentLocation: reminder.appointment_location,
       agentName: agent.name,
-      instanceUsed: instance.name,
+      instanceUsed: instanceName,
       responseTimeMs: executionLog.response_time_ms,
       messageLength: finalMessage.length,
       whatsappMessageId: sendResult.messageId,
