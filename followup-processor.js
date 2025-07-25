@@ -311,7 +311,7 @@ async function processFollowUp(supabase, config, followUp, generatePersonalizedM
     
     executionLog.message_sent = finalMessage;
     
-    // 4. Buscar instância WhatsApp
+    // 4. Buscar instância WhatsApp (opcional - sistema interno como fallback)
     const { data: instance, error: instanceError } = await supabase
       .from('whatsapp_instances')
       .select('name')
@@ -319,15 +319,23 @@ async function processFollowUp(supabase, config, followUp, generatePersonalizedM
       .eq('status', 'connected')
       .single();
     
+    const instanceName = instance?.name || 'internal_system';
+    
     if (instanceError || !instance?.name) {
-      throw new Error('Instância WhatsApp ativa não encontrada');
+      logFollowUp('debug', 'WhatsApp instance não encontrada, usando sistema interno', {
+        followUpId: followUp.id,
+        ruleName: followUp.rule_name,
+        companyId: followUp.company_id,
+        error: instanceError?.message
+      });
     }
     
-    logFollowUp('debug', 'Instância WhatsApp encontrada para follow-up', {
+    logFollowUp('debug', 'Instância para follow-up definida', {
       followUpId: followUp.id,
       ruleName: followUp.rule_name,
-      instanceName: instance.name,
-      companyId: followUp.company_id
+      instanceName: instanceName,
+      companyId: followUp.company_id,
+      type: instance?.name ? 'whatsapp' : 'internal'
     });
     
     // 5. Enviar mensagem via WhatsApp
@@ -336,12 +344,12 @@ async function processFollowUp(supabase, config, followUp, generatePersonalizedM
       ruleName: followUp.rule_name,
       contactName: context.contact?.first_name,
       contactPhone: context.contact?.phone?.substring(0, 8) + '...',
-      instanceName: instance.name,
+      instanceName: instanceName,
       messageLength: finalMessage.length
     });
     
     const sendResult = await sendWhatsAppMessage(
-      instance.name,
+      instanceName,
       context.contact.phone,
       finalMessage
     );
@@ -396,7 +404,7 @@ async function processFollowUp(supabase, config, followUp, generatePersonalizedM
         rule_name: followUp.rule_name,
         is_follow_up: true,
         sent_via: 'follow_up_server',
-        instance_name: instance.name,
+        instance_name: instanceName,
         ai_agent_id: followUp.agent_id,
         agent_name: agent.name
       }
@@ -433,7 +441,7 @@ async function processFollowUp(supabase, config, followUp, generatePersonalizedM
       contactName: context.contact?.first_name,
       contactPhone: context.contact?.phone?.substring(0, 8) + '...',
       agentName: agent.name,
-      instanceUsed: instance.name,
+      instanceUsed: instanceName,
       responseTimeMs: executionLog.response_time_ms,
       messageLength: finalMessage.length,
       whatsappMessageId: sendResult.messageId
