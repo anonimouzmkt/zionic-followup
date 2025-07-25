@@ -76,11 +76,10 @@ async function createAppointmentReminders(supabase) {
   try {
     logReminder('info', 'Criando lembretes automáticos para appointments...');
     
-    // Buscar empresas ativas
+    // Buscar todas as empresas (coluna is_active não existe)
     const { data: companies, error: companiesError } = await supabase
       .from('companies')
-      .select('id, name')
-      .eq('is_active', true);
+      .select('id, name');
     
     if (companiesError) {
       logReminder('error', 'Erro ao buscar empresas', { error: companiesError.message });
