@@ -27,7 +27,8 @@ const CONFIG = {
   supabaseKey: process.env.SUPABASE_SERVICE_ROLE_KEY,
   evolutionApiUrl: process.env.EVOLUTION_API_URL,
   evolutionApiKey: process.env.EVOLUTION_API_KEY,
-  zionicOpenAIKey: process.env.ZIONIC_OPENAI_KEY,
+  // ✅ CORRIGIDO: Usar master key conforme memória do usuário
+  masterOpenAIKey: process.env.OPENAI_MASTER_API_KEY,
   fallbackOpenAIKey: process.env.OPENAI_API_KEY,
   intervalMinutes: 1,
   maxFollowUpsPerExecution: 50,
@@ -86,6 +87,7 @@ function log(level, message, data = {}) {
 
 /**
  * Função para gerar mensagens personalizadas usando IA com threads persistentes
+ * ✅ CORRIGIDO: Usando mesma lógica do ChatSidebar.tsx que funciona
  */
 async function generatePersonalizedMessage(messageTemplate, context, agent, companyId) {
   try {
@@ -97,50 +99,66 @@ async function generatePersonalizedMessage(messageTemplate, context, agent, comp
       templateLength: messageTemplate.length
     });
 
-    // ✅ 1. Buscar ou criar thread OpenAI para a conversa/lembrete
-    const threadId = await getOrCreateThread(context, agent, companyId);
+    // ✅ 1. Buscar chave OpenAI (master key sempre, conforme memória do usuário)
+    let openaiApiKey = CONFIG.masterOpenAIKey;
     
-    if (!threadId) {
-      log('warning', 'Não foi possível obter thread, usando template simples');
+    if (!openaiApiKey) {
+      log('warning', 'Master key não encontrada, usando fallback');
+      openaiApiKey = CONFIG.fallbackOpenAIKey;
+    }
+    
+    if (!openaiApiKey) {
+      log('error', 'Nenhuma chave OpenAI disponível');
       return messageTemplate;
     }
 
-    // ✅ 2. Tentar com Assistant + Thread (se agente tem assistant)
-    if (agent.openai_assistant_id && agent.openai_assistant_id.startsWith('asst_')) {
+    // ✅ 2. Para follow-ups, SEMPRE usar thread existente da conversa
+    if (context.conversation && !context.appointmentId) {
+      const threadId = context.conversation.openai_thread_id;
+      
+      if (!threadId) {
+        log('warning', 'Conversa sem thread OpenAI - usando template simples para preservar contexto');
+        return messageTemplate;
+      }
+      
+      log('debug', 'Reutilizando thread existente para follow-up', {
+        threadId: threadId,
+        conversationId: context.conversation.id
+      });
+      
+      // ✅ 3. Tentar gerar resposta personalizada usando thread existente
       try {
-        return await generateWithAssistantAndThread(
+        return await generateWithExistingThread(
           messageTemplate, 
           context, 
           agent, 
           threadId,
-          companyId
+          openaiApiKey
         );
-      } catch (assistantError) {
-        log('warning', 'Falha no Assistant, tentando com Thread direta', { 
-          error: assistantError.message,
+      } catch (threadError) {
+        log('warning', 'Falha ao usar thread existente, usando template simples', { 
+          error: threadError.message,
           agentId: agent.id 
         });
+        return messageTemplate;
       }
     }
-
-    // ✅ 3. Fallback: Thread + modelo direto
+    
+    // ✅ 4. Para appointments ou outros casos, usar geração simples
     try {
-      return await generateWithThreadOnly(
-        messageTemplate, 
-        context, 
-        agent, 
-        threadId,
-        companyId
+      return await generateWithDirectAPI(
+        messageTemplate,
+        context,
+        agent,
+        openaiApiKey
       );
-    } catch (threadError) {
-      log('warning', 'Falha na Thread, usando template simples', { 
-        error: threadError.message,
+    } catch (directError) {
+      log('warning', 'Falha na geração direta, usando template simples', { 
+        error: directError.message,
         agentId: agent.id 
       });
+      return messageTemplate;
     }
-
-    // ✅ 4. Fallback final: template com substituições básicas
-    return messageTemplate;
 
   } catch (error) {
     log('error', 'Erro na geração de mensagem personalizada', { 
@@ -152,273 +170,196 @@ async function generatePersonalizedMessage(messageTemplate, context, agent, comp
 }
 
 /**
- * Obter ou criar thread OpenAI
+ * ✅ NOVO: Gerar usando thread existente (igual ChatSidebar.tsx)
  */
-async function getOrCreateThread(context, agent, companyId) {
-  try {
-    const openaiKey = await getOpenAIKey(companyId);
-    
-    // Para lembretes, criar thread nova (contexto específico do appointment)
-    if (context.appointmentId) {
-      log('debug', 'Criando nova thread para lembrete de appointment', {
-        appointmentId: context.appointmentId,
-        agentId: agent.id
-      });
-      
-      const response = await axios.post('https://api.openai.com/v1/threads', {}, {
-        headers: {
-          'Authorization': `Bearer ${openaiKey}`,
-          'Content-Type': 'application/json',
-          'OpenAI-Beta': 'assistants=v2'
-        }
-      });
-      
-      return response.data.id;
+async function generateWithExistingThread(messageTemplate, context, agent, threadId, openaiApiKey) {
+  // Construir prompt contextual
+  const recentMessages = context.recentMessages?.slice(-3).map(m => 
+    `${m.sent_by_ai ? 'Agente' : 'Cliente'}: ${m.content}`
+  ).join('\n') || 'Nenhuma mensagem recente';
+  
+  const contextualPrompt = `[INSTRUÇÃO PARA FOLLOW-UP]
+
+Você está assumindo uma conversa existente para envio de follow-up automático.
+
+TEMPLATE ORIGINAL: "${messageTemplate}"
+
+CONTEXTO DA CONVERSA:
+- Contato: ${context.contact?.first_name || 'Cliente'}
+- Telefone: ${context.contact?.phone?.substring(0, 8) + '...' || 'Não disponível'}
+- Última atividade: ${context.lastMessage?.sent_at || 'Não disponível'}
+- Total de mensagens: ${context.messageCount || 0}
+- Cliente já respondeu: ${context.hasContactMessages ? 'Sim' : 'Não'}
+
+MENSAGENS RECENTES:
+${recentMessages}
+
+INSTRUÇÕES:
+1. Personalize o template com base no contexto da conversa
+2. Mantenha tom natural e não robótico
+3. Seja breve e objetivo (máximo 150 caracteres)
+4. NÃO inicie com saudações pois é um follow-up
+5. Foque em reativação baseada no que foi conversado
+6. Use o nome do cliente quando possível
+
+Gere apenas a mensagem final personalizada, sem explicações.`;
+
+  // ✅ Adicionar mensagem à thread existente
+  await axios.post(`https://api.openai.com/v1/threads/${threadId}/messages`, {
+    role: 'user',
+    content: contextualPrompt,
+    metadata: {
+      type: 'follow_up_request',
+      template_length: messageTemplate.length,
+      created_at: new Date().toISOString()
     }
-    
-    // Para follow-ups, SEMPRE buscar thread existente da conversa
-    if (context.conversation) {
-      // ✅ BUSCAR thread_id da coluna openai_thread_id da conversa
-      const existingThreadId = context.conversation.openai_thread_id;
-      
-      if (existingThreadId) {
-        log('debug', 'Reutilizando thread existente para follow-up', {
-          threadId: existingThreadId,
-          conversationId: context.conversation.id
-        });
-        return existingThreadId;
-      }
-      
-      // ⚠️ Se não tem thread, é porque nunca foi criada - BUSCAR no banco novamente
-      log('warning', 'Thread não encontrada na conversa, buscando no banco', {
-        conversationId: context.conversation.id
-      });
-      
-      const { data: conversationData, error } = await supabase
-        .from('conversations')
-        .select('openai_thread_id')
-        .eq('id', context.conversation.id)
-        .single();
-        
-      if (!error && conversationData?.openai_thread_id) {
-        log('debug', 'Thread encontrada no banco para follow-up', {
-          threadId: conversationData.openai_thread_id,
-          conversationId: context.conversation.id
-        });
-        return conversationData.openai_thread_id;
-      }
-      
-      // ❌ SÓ CRIAR NOVA se realmente não existir - PRESERVAR CONTEXTO
-      log('error', 'ATENÇÃO: Conversa sem thread OpenAI - isso vai perder contexto!', {
-        conversationId: context.conversation.id,
-        action: 'should_create_thread_manually'
-      });
-      
-      return null; // Não criar automaticamente - preservar contexto
+  }, {
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${openaiApiKey}`,
+      'OpenAI-Beta': 'assistants=v2'
     }
-    
-    return null;
-    
-  } catch (error) {
-    log('error', 'Erro ao obter/criar thread OpenAI', { error: error.message });
-    return null;
+  });
+
+  // ✅ Se agente tem assistant, usar Assistant API
+  if (agent.openai_assistant_id && agent.openai_assistant_id.startsWith('asst_')) {
+    return await executeAssistantRun(threadId, agent, openaiApiKey);
+  } else {
+    // ✅ Usar completion direta com contexto da thread
+    return await executeDirectCompletion(contextualPrompt, agent, openaiApiKey);
   }
 }
 
 /**
- * Gerar com Assistant + Thread
+ * ✅ NOVO: Executar Assistant API
  */
-async function generateWithAssistantAndThread(messageTemplate, context, agent, threadId, companyId) {
-  const openaiKey = await getOpenAIKey(companyId);
-  
-  // Adicionar mensagem do sistema à thread
-  await addSystemMessageToThread(threadId, messageTemplate, context, agent, openaiKey);
-  
-  // Executar assistant na thread
+async function executeAssistantRun(threadId, agent, openaiApiKey) {
+  // Criar run
   const runResponse = await axios.post(`https://api.openai.com/v1/threads/${threadId}/runs`, {
     assistant_id: agent.openai_assistant_id,
     temperature: agent.temperature || 0.7,
-    max_tokens: agent.max_tokens || 500
+    max_tokens: 150, // Limite para follow-ups
+    metadata: {
+      type: 'follow_up_generation',
+      agent_id: agent.id
+    }
   }, {
     headers: {
-      'Authorization': `Bearer ${openaiKey}`,
       'Content-Type': 'application/json',
+      'Authorization': `Bearer ${openaiApiKey}`,
       'OpenAI-Beta': 'assistants=v2'
     }
   });
-  
-  // Aguardar conclusão
+
   let run = runResponse.data;
-  while (run.status === 'in_progress' || run.status === 'queued') {
+  let attempts = 0;
+  const maxAttempts = 30; // 30 segundos timeout
+
+  // Aguardar conclusão
+  while ((run.status === 'in_progress' || run.status === 'queued') && attempts < maxAttempts) {
     await new Promise(resolve => setTimeout(resolve, 1000));
+    attempts++;
+    
     const statusResponse = await axios.get(`https://api.openai.com/v1/threads/${threadId}/runs/${run.id}`, {
       headers: {
-        'Authorization': `Bearer ${openaiKey}`,
+        'Authorization': `Bearer ${openaiApiKey}`,
         'OpenAI-Beta': 'assistants=v2'
       }
     });
+    
     run = statusResponse.data;
   }
-  
+
   if (run.status !== 'completed') {
-    throw new Error(`Run falhou com status: ${run.status}`);
+    throw new Error(`Assistant run falhou: ${run.status} (${run.last_error?.message || 'timeout'})`);
   }
-  
+
   // Buscar resposta
-  const messagesResponse = await axios.get(`https://api.openai.com/v1/threads/${threadId}/messages`, {
+  const messagesResponse = await axios.get(`https://api.openai.com/v1/threads/${threadId}/messages?limit=1`, {
     headers: {
-      'Authorization': `Bearer ${openaiKey}`,
+      'Authorization': `Bearer ${openaiApiKey}`,
       'OpenAI-Beta': 'assistants=v2'
     }
   });
-  
+
   const lastMessage = messagesResponse.data.data[0];
   if (lastMessage?.content?.[0]?.text?.value) {
     return lastMessage.content[0].text.value.trim();
   }
-  
+
   throw new Error('Nenhuma resposta encontrada do Assistant');
 }
 
 /**
- * Gerar com Thread + modelo direto
+ * ✅ NOVO: Geração direta via Completion API
  */
-async function generateWithThreadOnly(messageTemplate, context, agent, threadId, companyId) {
-  const openaiKey = await getOpenAIKey(companyId);
-  
-  // Adicionar mensagem do usuário à thread
-  await axios.post(`https://api.openai.com/v1/threads/${threadId}/messages`, {
-    role: 'user',
-    content: buildPrompt(messageTemplate, context, agent)
-  }, {
-    headers: {
-      'Authorization': `Bearer ${openaiKey}`,
-      'Content-Type': 'application/json',
-      'OpenAI-Beta': 'assistants=v2'
-    }
-  });
-  
-  // Chamar completion diretamente
+async function executeDirectCompletion(prompt, agent, openaiApiKey) {
   const completion = await axios.post('https://api.openai.com/v1/chat/completions', {
     model: agent.openai_model || 'gpt-4',
     messages: [
       {
         role: 'system',
-        content: buildSystemPrompt(agent, context)
+        content: `Você é ${agent.name}. Você é especialista em follow-ups de reativação de leads. Seja natural, breve e contextual.`
       },
       {
         role: 'user',
-        content: buildPrompt(messageTemplate, context, agent)
+        content: prompt
       }
     ],
     temperature: agent.temperature || 0.7,
-    max_tokens: agent.max_tokens || 500
+    max_tokens: 150
   }, {
     headers: {
-      'Authorization': `Bearer ${openaiKey}`,
+      'Authorization': `Bearer ${openaiApiKey}`,
       'Content-Type': 'application/json'
     }
   });
-  
+
   const response = completion.data.choices[0]?.message?.content?.trim();
   if (!response) {
-    throw new Error('Nenhuma resposta da OpenAI');
+    throw new Error('Nenhuma resposta da OpenAI Completion');
   }
-  
+
   return response;
 }
 
 /**
- * Adicionar mensagem do sistema à thread
+ * ✅ NOVO: Geração para appointments ou casos sem thread
  */
-async function addSystemMessageToThread(threadId, messageTemplate, context, agent, openaiKey) {
-  const systemPrompt = buildSystemPrompt(agent, context);
-  const userPrompt = buildPrompt(messageTemplate, context, agent);
+async function generateWithDirectAPI(messageTemplate, context, agent, openaiApiKey) {
+  let prompt;
   
-  await axios.post(`https://api.openai.com/v1/threads/${threadId}/messages`, {
-    role: 'user',
-    content: `${systemPrompt}\n\n${userPrompt}`
-  }, {
-    headers: {
-      'Authorization': `Bearer ${openaiKey}`,
-      'Content-Type': 'application/json',
-      'OpenAI-Beta': 'assistants=v2'
-    }
-  });
-}
-
-/**
- * Construir prompt do sistema
- */
-function buildSystemPrompt(agent, context) {
   if (context.appointmentId) {
-    return `Você é ${agent.name}, um assistente especializado em lembretes de appointments.
-    
-Sua função: Personalizar lembretes de appointments de forma natural e empática.
+    // Para lembretes de appointment
+    prompt = `Personalize este lembrete de appointment de forma natural:
 
-Diretrizes:
-- Mantenha tom profissional e cordial
-- Inclua informações relevantes do appointment
-- Seja claro sobre data, horário e local
-- Use linguagem natural e acolhedora
-- Evite ser muito formal ou robótico`;
-  } else {
-    return agent.system_prompt || `Você é ${agent.name}, um assistente de follow-up.
-    
-Sua função: Gerar mensagens de follow-up personalizadas para reativação de leads.
+TEMPLATE: "${messageTemplate}"
 
-Diretrizes:
-- Personalize com base no contexto da conversa
-- Mantenha tom natural e não invasivo
-- Foque em reativação sem ser insistente
-- Use informações do contato quando disponível`;
-  }
-}
-
-/**
- * Construir prompt da mensagem
- */
-function buildPrompt(messageTemplate, context, agent) {
-  if (context.appointmentId) {
-    return `Personalize este lembrete de appointment:
-    
-Template: "${messageTemplate}"
-
-Dados do appointment:
+DADOS DO APPOINTMENT:
 - Contato: ${context.contactName}
-- Título: ${context.appointmentTitle}
+- Título: ${context.appointmentTitle || 'Agendamento'}
 - Data/Hora: ${context.appointmentDate}
-- Local: ${context.appointmentLocation || 'Não especificado'}
-- Tipo de lembrete: ${context.reminderType}
-- Minutos antes: ${context.minutesBefore}
+- Local: ${context.appointmentLocation || 'A definir'}
+- Tipo: ${context.reminderType || 'Lembrete'}
 
-Gere uma versão personalizada e natural do lembrete.`;
+Gere uma versão natural e cordial do lembrete. Seja breve e claro.`;
   } else {
-    const recentMessages = context.recentMessages?.slice(-3).map(m => 
-      `${m.sent_by_ai ? 'Agente' : 'Cliente'}: ${m.content}`
-    ).join('\n') || 'Nenhuma mensagem recente';
-    
-    return `Personalize esta mensagem de follow-up:
-    
-Template: "${messageTemplate}"
+    // Para follow-ups sem thread
+    prompt = `Personalize esta mensagem de follow-up:
 
-Contexto da conversa:
+TEMPLATE: "${messageTemplate}"
+
+CONTEXTO:
 - Contato: ${context.contact?.first_name || 'Cliente'}
-- Última atividade: ${context.lastMessage?.sent_at || 'Não disponível'}
-- Mensagens recentes:
-${recentMessages}
+- Empresa: ${context.contact?.company_name || 'Não informado'}
 
-Gere uma versão personalizada e contextual.`;
+Gere uma versão personalizada e natural. Seja breve (máximo 150 caracteres).`;
   }
+
+  return await executeDirectCompletion(prompt, agent, openaiApiKey);
 }
 
-/**
- * Obter chave OpenAI (sempre usar master key)
- */
-async function getOpenAIKey(companyId) {
-  // ✅ SEMPRE usar master key (Zionic Credits)
-  return CONFIG.zionicOpenAIKey || CONFIG.fallbackOpenAIKey;
-}
+// ✅ Funções antigas removidas - agora usando lógica do ChatSidebar.tsx
 
 // ===============================================
 // ENVIO WHATSAPP
