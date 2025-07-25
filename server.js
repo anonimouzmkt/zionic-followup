@@ -271,7 +271,7 @@ Gere apenas a mensagem final personalizada, sem explicações.`;
       content: contextualPrompt,
       metadata: {
         type: 'follow_up_request',
-        template_length: messageTemplate.length,
+        template_length: messageTemplate.length.toString(), // ✅ CORRIGIDO: Converter para string
         created_at: new Date().toISOString()
       }
     }, {
@@ -324,7 +324,7 @@ async function executeAssistantRun(threadId, agent, openaiApiKey) {
       max_tokens: 150, // Limite para follow-ups
       metadata: {
         type: 'follow_up_generation',
-        agent_id: agent.id
+        agent_id: agent.id.toString() // ✅ CORRIGIDO: Converter ID para string
       }
     }, {
       headers: {
