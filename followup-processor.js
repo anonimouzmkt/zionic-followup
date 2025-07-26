@@ -42,7 +42,7 @@ async function getPendingFollowUps(supabase, config) {
   try {
     logFollowUp('info', 'Buscando follow-ups pendentes...');
     
-    // ✅ NOVA CONSULTA: Buscar follow-ups com verificação de agente e status
+    // ✅ NOVA CONSULTA: Buscar follow-ups com verificação de agente e status (SEM colunas inexistentes)
     const { data: followUps, error } = await supabase
       .from('follow_up_queue')
       .select(`
@@ -58,13 +58,15 @@ async function getPendingFollowUps(supabase, config) {
         max_attempts,
         status,
         metadata,
-        contact_name,
-        contact_phone,
         conversations!inner(
           ai_agent_id,
           ai_enabled,
           assigned_to,
           metadata
+        ),
+        contacts!inner(
+          first_name,
+          phone
         )
       `)
       .eq('status', 'pending')
@@ -232,17 +234,17 @@ async function processFollowUp(supabase, config, followUp, generatePersonalizedM
   };
   
   try {
-    logFollowUp('info', `🚀 INICIANDO FOLLOW-UP`, { 
-      followUpId: followUp.id,
-      ruleName: followUp.rule_name,
-      contactName: followUp.contact_name || 'Nome não encontrado',
-      contactPhone: followUp.contact_phone?.substring(0, 8) + '...' || 'Phone não encontrado',
-      companyId: followUp.company_id,
-      agentId: followUp.agent_id,
-      minutesOverdue: followUp.minutes_overdue,
-      maxAttempts: followUp.max_attempts,
-      currentAttempts: followUp.attempts
-    });
+         logFollowUp('info', `🚀 INICIANDO FOLLOW-UP`, { 
+       followUpId: followUp.id,
+       ruleName: followUp.rule_name,
+       contactName: followUp.contacts?.first_name || 'Nome não encontrado',
+       contactPhone: followUp.contacts?.phone?.substring(0, 8) + '...' || 'Phone não encontrado',
+       companyId: followUp.company_id,
+       agentId: followUp.agent_id,
+       minutesOverdue: followUp.minutes_overdue,
+       maxAttempts: followUp.max_attempts,
+       currentAttempts: followUp.attempts
+     });
     
     // ✅ Verificar se follow-up ainda está pendente
     const { data: currentStatus, error: statusError } = await supabase
@@ -279,13 +281,13 @@ async function processFollowUp(supabase, config, followUp, generatePersonalizedM
 
     // ✅ 1. Verificar se conversa tem agente IA atribuído
     if (!conversation.ai_agent_id) {
-      logFollowUp('warning', 'Follow-up cancelado - conversa não tem agente IA atribuído', { 
-        followUpId: followUp.id,
-        ruleName: followUp.rule_name,
-        contactName: followUp.contact_name,
-        conversationId: followUp.conversation_id,
-        reason: 'no_agent_assigned'
-      });
+             logFollowUp('warning', 'Follow-up cancelado - conversa não tem agente IA atribuído', { 
+         followUpId: followUp.id,
+         ruleName: followUp.rule_name,
+         contactName: followUp.contacts?.first_name || 'Nome não encontrado',
+         conversationId: followUp.conversation_id,
+         reason: 'no_agent_assigned'
+       });
       
       // Marcar follow-up como cancelado
       await supabase
@@ -306,14 +308,14 @@ async function processFollowUp(supabase, config, followUp, generatePersonalizedM
 
     // ✅ 2. Verificar se agente IA está pausado (ai_enabled = false)
     if (conversation.ai_enabled === false) {
-      logFollowUp('warning', 'Follow-up cancelado - agente IA está pausado', { 
-        followUpId: followUp.id,
-        ruleName: followUp.rule_name,
-        contactName: followUp.contact_name,
-        conversationId: followUp.conversation_id,
-        agentId: conversation.ai_agent_id,
-        reason: 'agent_paused'
-      });
+             logFollowUp('warning', 'Follow-up cancelado - agente IA está pausado', { 
+         followUpId: followUp.id,
+         ruleName: followUp.rule_name,
+         contactName: followUp.contacts?.first_name || 'Nome não encontrado',
+         conversationId: followUp.conversation_id,
+         agentId: conversation.ai_agent_id,
+         reason: 'agent_paused'
+       });
       
       // Marcar follow-up como cancelado
       await supabase
@@ -335,14 +337,14 @@ async function processFollowUp(supabase, config, followUp, generatePersonalizedM
 
     // ✅ 3. Verificar se conversa foi atribuída a humano (igual whatsapp-webhook)
     if (conversation.assigned_to && conversation.ai_enabled === false) {
-      logFollowUp('warning', 'Follow-up cancelado - conversa atribuída a agente humano', { 
-        followUpId: followUp.id,
-        ruleName: followUp.rule_name,
-        contactName: followUp.contact_name,
-        conversationId: followUp.conversation_id,
-        assignedTo: conversation.assigned_to,
-        reason: 'assigned_to_human'
-      });
+             logFollowUp('warning', 'Follow-up cancelado - conversa atribuída a agente humano', { 
+         followUpId: followUp.id,
+         ruleName: followUp.rule_name,
+         contactName: followUp.contacts?.first_name || 'Nome não encontrado',
+         conversationId: followUp.conversation_id,
+         assignedTo: conversation.assigned_to,
+         reason: 'assigned_to_human'
+       });
       
       // Marcar follow-up como cancelado
       await supabase
@@ -364,15 +366,15 @@ async function processFollowUp(supabase, config, followUp, generatePersonalizedM
 
     // ✅ 4. Verificar se follow-ups estão pausados para esta conversa (ChatSidebar)
     if (conversation.metadata?.follow_up_paused === true) {
-      logFollowUp('warning', 'Follow-up cancelado - follow-ups pausados para esta conversa', { 
-        followUpId: followUp.id,
-        ruleName: followUp.rule_name,
-        contactName: followUp.contact_name,
-        conversationId: followUp.conversation_id,
-        pausedAt: conversation.metadata.follow_up_paused_at,
-        pausedBy: conversation.metadata.follow_up_paused_by,
-        reason: 'follow_ups_paused'
-      });
+             logFollowUp('warning', 'Follow-up cancelado - follow-ups pausados para esta conversa', { 
+         followUpId: followUp.id,
+         ruleName: followUp.rule_name,
+         contactName: followUp.contacts?.first_name || 'Nome não encontrado',
+         conversationId: followUp.conversation_id,
+         pausedAt: conversation.metadata.follow_up_paused_at,
+         pausedBy: conversation.metadata.follow_up_paused_by,
+         reason: 'follow_ups_paused'
+       });
       
       // Marcar follow-up como cancelado
       await supabase
@@ -395,13 +397,13 @@ async function processFollowUp(supabase, config, followUp, generatePersonalizedM
     
     // ✅ Verificar se ainda pode tentar
     if (currentStatus.attempts >= followUp.max_attempts) {
-      logFollowUp('warning', 'Follow-up já atingiu máximo de tentativas', { 
-        followUpId: followUp.id,
-        ruleName: followUp.rule_name,
-        contactName: followUp.contact_name,
-        currentAttempts: currentStatus.attempts,
-        maxAttempts: followUp.max_attempts
-      });
+             logFollowUp('warning', 'Follow-up já atingiu máximo de tentativas', { 
+         followUpId: followUp.id,
+         ruleName: followUp.rule_name,
+         contactName: followUp.contacts?.first_name || 'Nome não encontrado',
+         currentAttempts: currentStatus.attempts,
+         maxAttempts: followUp.max_attempts
+       });
       
       // Marcar como failed
       await supabase
@@ -424,14 +426,14 @@ async function processFollowUp(supabase, config, followUp, generatePersonalizedM
     // ✅ NOVA VALIDAÇÃO: Verificar status do agente antes de prosseguir (igual whatsapp-webhook)
     const agentValidation = await validateAgentConditions(supabase, context.conversation, followUp.agent_id);
     if (!agentValidation.canRespond) {
-      logFollowUp('warning', 'Follow-up cancelado - agente não pode responder', {
-        followUpId: followUp.id,
-        ruleName: followUp.rule_name,
-        contactName: followUp.contact_name,
-        conversationId: followUp.conversation_id,
-        agentId: followUp.agent_id,
-        reason: agentValidation.reason
-      });
+             logFollowUp('warning', 'Follow-up cancelado - agente não pode responder', {
+         followUpId: followUp.id,
+         ruleName: followUp.rule_name,
+         contactName: followUp.contacts?.first_name || 'Nome não encontrado',
+         conversationId: followUp.conversation_id,
+         agentId: followUp.agent_id,
+         reason: agentValidation.reason
+       });
       
       // Marcar follow-up como cancelado
       await supabase
@@ -661,18 +663,18 @@ async function processFollowUp(supabase, config, followUp, generatePersonalizedM
       })
       .eq('id', followUp.id);
     
-    logFollowUp('error', `❌ ERRO NO FOLLOW-UP`, {
-      followUpId: followUp.id,
-      ruleName: followUp.rule_name,
-      contactName: followUp.contact_name || 'Nome não encontrado',
-      contactPhone: followUp.contact_phone?.substring(0, 8) + '...' || 'Phone não encontrado',
-      agentId: followUp.agent_id,
-      error: error.message,
-      attempts: newAttempts,
-      maxAttempts: followUp.max_attempts,
-      finalStatus: status,
-      responseTimeMs: executionLog.response_time_ms
-    });
+         logFollowUp('error', `❌ ERRO NO FOLLOW-UP`, {
+       followUpId: followUp.id,
+       ruleName: followUp.rule_name,
+       contactName: followUp.contacts?.first_name || 'Nome não encontrado',
+       contactPhone: followUp.contacts?.phone?.substring(0, 8) + '...' || 'Phone não encontrado',
+       agentId: followUp.agent_id,
+       error: error.message,
+       attempts: newAttempts,
+       maxAttempts: followUp.max_attempts,
+       finalStatus: status,
+       responseTimeMs: executionLog.response_time_ms
+     });
     
     return { success: false, error: error.message };
     
