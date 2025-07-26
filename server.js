@@ -257,44 +257,8 @@ INSTRUÇÕES:
 
 Gere apenas a mensagem final personalizada, sem explicações.`;
 
-  // ✅ Adicionar mensagem à thread existente
-  try {
-    log('debug', 'Tentando adicionar mensagem à thread', {
-      threadId: threadId,
-      hasApiKey: !!openaiApiKey,
-      apiKeyPrefix: openaiApiKey ? openaiApiKey.substring(0, 7) + '...' : 'null',
-      promptLength: contextualPrompt.length
-    });
-
-    await axios.post(`https://api.openai.com/v1/threads/${threadId}/messages`, {
-      role: 'user',
-      content: contextualPrompt,
-      metadata: {
-        type: 'follow_up_request',
-        template_length: messageTemplate.length.toString(), // ✅ CORRIGIDO: Converter para string
-        created_at: new Date().toISOString()
-      }
-    }, {
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${openaiApiKey}`,
-        'OpenAI-Beta': 'assistants=v2'
-      }
-    });
-
-    log('success', 'Mensagem adicionada à thread com sucesso');
-  } catch (addMessageError) {
-    log('error', 'ERRO DETALHADO ao adicionar mensagem à thread', {
-      error: addMessageError.message,
-      status: addMessageError.response?.status,
-      statusText: addMessageError.response?.statusText,
-      data: addMessageError.response?.data,
-      headers: addMessageError.response?.headers,
-      threadId: threadId,
-      hasApiKey: !!openaiApiKey
-    });
-    throw addMessageError;
-  }
+  // ✅ Adicionar mensagem à thread existente usando função auxiliar (igual ao automation-ai-handler)  
+  await addMessageToOpenAIThread(openaiApiKey, threadId, contextualPrompt, 'user');
 
   // ✅ Se agente tem assistant, usar Assistant API
   if (agent.openai_assistant_id && agent.openai_assistant_id.startsWith('asst_')) {
@@ -306,7 +270,7 @@ Gere apenas a mensagem final personalizada, sem explicações.`;
 }
 
 /**
- * ✅ NOVO: Executar Assistant API
+ * ✅ NOVO: Executar Assistant API (copiado EXATAMENTE do automation-ai-handler)
  */
 async function executeAssistantRun(threadId, agent, openaiApiKey) {
   try {
@@ -317,16 +281,27 @@ async function executeAssistantRun(threadId, agent, openaiApiKey) {
       hasApiKey: !!openaiApiKey
     });
 
-    // Criar run
-    const runResponse = await axios.post(`https://api.openai.com/v1/threads/${threadId}/runs`, {
-      assistant_id: agent.openai_assistant_id,
-      temperature: agent.temperature || 0.7,
-      max_tokens: 150, // Limite para follow-ups
-      metadata: {
-        type: 'follow_up_generation',
-        agent_id: agent.id.toString() // ✅ CORRIGIDO: Converter ID para string
-      }
-    }, {
+    // ✅ CORRIGIDO: Usar mesmo payload do automation-ai-handler (SEM max_tokens para Assistant API)
+    let runPayload;
+    
+    if (agent.openai_assistant_id) {
+      runPayload = {
+        assistant_id: agent.openai_assistant_id
+      };
+    } else if (agent.assistant_id) {
+      runPayload = {
+        assistant_id: agent.assistant_id
+      };
+    } else {
+      runPayload = {
+        model: agent.openai_model || 'gpt-4o-mini',
+        temperature: agent.temperature ?? 0.7,
+        max_tokens: agent.max_tokens || 300,
+        instructions: agent.system_prompt || `Você é ${agent.name}, um assistente de atendimento ao cliente.`
+      };
+    }
+
+    const runResponse = await axios.post(`https://api.openai.com/v1/threads/${threadId}/runs`, runPayload, {
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${openaiApiKey}`,
@@ -334,57 +309,100 @@ async function executeAssistantRun(threadId, agent, openaiApiKey) {
       }
     });
 
-    log('success', 'Run criado com sucesso', { runId: runResponse.data.id });
-  } catch (runError) {
+    if (!runResponse.data || !runResponse.data.id) {
+      throw new Error('Failed to start run - no run ID returned');
+    }
+
+    const runData = runResponse.data;
+    const runId = runData.id;
+    let status = runData.status;
+
+    log('success', `Run started: ${runId}, status: ${status}`);
+
+    // Poll for completion (igual ao automation-ai-handler)
+    let attempts = 0;
+    const maxAttempts = 30;
+
+    while (status !== 'completed' && status !== 'failed' && attempts < maxAttempts) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      attempts++;
+
+      const statusResponse = await axios.get(`https://api.openai.com/v1/threads/${threadId}/runs/${runId}`, {
+        headers: {
+          'Authorization': `Bearer ${openaiApiKey}`,
+          'OpenAI-Beta': 'assistants=v2'
+        }
+      });
+
+      if (statusResponse.data) {
+        status = statusResponse.data.status;
+        log('debug', `Run status: ${status} (attempt ${attempts})`);
+        
+        if (status === 'failed') {
+          log('error', 'Run failed:', statusResponse.data);
+          break;
+        }
+      }
+    }
+
+    if (status === 'completed') {
+      log('success', 'OpenAI run completed successfully');
+      
+      // ✅ Buscar dados finais do run para pegar usage (igual ao automation-ai-handler)
+      log('debug', `Fetching final run data for usage: ${runId}`);
+      
+      const finalResponse = await axios.get(`https://api.openai.com/v1/threads/${threadId}/runs/${runId}`, {
+        headers: {
+          'Authorization': `Bearer ${openaiApiKey}`,
+          'OpenAI-Beta': 'assistants=v2'
+        }
+      });
+
+      if (finalResponse.data && finalResponse.data.usage) {
+        log('debug', 'Assistant run usage:', finalResponse.data.usage);
+        log('success', `Usage found: ${finalResponse.data.usage.total_tokens} tokens`);
+      } else {
+        log('warning', 'Usage field is null/undefined in response');
+      }
+      
+      // Buscar última mensagem do assistant
+      const messagesResponse = await axios.get(`https://api.openai.com/v1/threads/${threadId}/messages?order=desc&limit=1`, {
+        headers: {
+          'Authorization': `Bearer ${openaiApiKey}`,
+          'OpenAI-Beta': 'assistants=v2'
+        }
+      });
+
+      const messages = messagesResponse.data.data;
+      for (const message of messages) {
+        if (message.role === 'assistant' && message.content?.length > 0) {
+          const textContent = message.content.find(c => c.type === 'text');
+          if (textContent?.text?.value) {
+            return textContent.text.value.trim();
+          }
+        }
+      }
+
+      throw new Error('No response from OpenAI assistant');
+      
+    } else if (status === 'failed') {
+      throw new Error('OpenAI run failed');
+    } else {
+      throw new Error('OpenAI run timeout');
+    }
+
+  } catch (error) {
     log('error', 'ERRO DETALHADO ao criar Assistant Run', {
-      error: runError.message,
-      status: runError.response?.status,
-      statusText: runError.response?.statusText,
-      data: runError.response?.data,
+      error: error.message,
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+      data: error.response?.data,
       threadId: threadId,
-      assistantId: agent.openai_assistant_id,
+      assistantId: agent.openai_assistant_id || agent.assistant_id,
       hasApiKey: !!openaiApiKey
     });
-    throw runError;
+    throw error;
   }
-
-  let run = runResponse.data;
-  let attempts = 0;
-  const maxAttempts = 30; // 30 segundos timeout
-
-  // Aguardar conclusão
-  while ((run.status === 'in_progress' || run.status === 'queued') && attempts < maxAttempts) {
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    attempts++;
-    
-    const statusResponse = await axios.get(`https://api.openai.com/v1/threads/${threadId}/runs/${run.id}`, {
-      headers: {
-        'Authorization': `Bearer ${openaiApiKey}`,
-        'OpenAI-Beta': 'assistants=v2'
-      }
-    });
-    
-    run = statusResponse.data;
-  }
-
-  if (run.status !== 'completed') {
-    throw new Error(`Assistant run falhou: ${run.status} (${run.last_error?.message || 'timeout'})`);
-  }
-
-  // Buscar resposta
-  const messagesResponse = await axios.get(`https://api.openai.com/v1/threads/${threadId}/messages?limit=1`, {
-    headers: {
-      'Authorization': `Bearer ${openaiApiKey}`,
-      'OpenAI-Beta': 'assistants=v2'
-    }
-  });
-
-  const lastMessage = messagesResponse.data.data[0];
-  if (lastMessage?.content?.[0]?.text?.value) {
-    return lastMessage.content[0].text.value.trim();
-  }
-
-  throw new Error('Nenhuma resposta encontrada do Assistant');
 }
 
 /**
@@ -503,7 +521,95 @@ Gere uma versão personalizada e natural. Seja breve (máximo 150 caracteres).`;
   }
 }
 
-// ✅ Funções antigas removidas - agora usando lógica do ChatSidebar.tsx
+// ✅ FUNÇÃO AUXILIAR: Obter ou criar thread OpenAI (copiada EXATAMENTE do automation-ai-handler)
+async function getOrCreateOpenAIThread(
+  apiKey,
+  conversationId,
+  agent,
+  context
+) {
+  try {
+    // Verificar se já existe thread
+    const { data: conversation } = await supabase
+      .from('conversations')
+      .select('openai_thread_id')
+      .eq('id', conversationId)
+      .single();
+
+    if (conversation?.openai_thread_id) {
+      log('debug', `🔄 Reusing existing thread: ${conversation.openai_thread_id}`);
+      return conversation.openai_thread_id;
+    }
+
+    // Criar novo thread
+    log('debug', '🆕 Creating new OpenAI thread...');
+    const response = await fetch('https://api.openai.com/v1/threads', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'OpenAI-Beta': 'assistants=v2'
+      }
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => null);
+      throw new Error(`Failed to create thread: ${response.status} - ${errorData?.error?.message || 'Unknown error'}`);
+    }
+
+    const threadData = await response.json();
+    const threadId = threadData.id;
+
+    // Salvar thread ID
+    await supabase
+      .from('conversations')
+      .update({ 
+        openai_thread_id: threadId,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', conversationId);
+
+    log('success', `✅ Created thread: ${threadId}`);
+    return threadId;
+
+  } catch (error) {
+    log('error', '❌ Error creating thread:', error);
+    return null;
+  }
+}
+
+// ✅ FUNÇÃO AUXILIAR: Adicionar mensagem ao thread OpenAI (copiada EXATAMENTE do automation-ai-handler)
+async function addMessageToOpenAIThread(
+  apiKey,
+  threadId,
+  content,
+  role
+) {
+  try {
+    const response = await fetch(`https://api.openai.com/v1/threads/${threadId}/messages`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'OpenAI-Beta': 'assistants=v2'
+      },
+      body: JSON.stringify({
+        role: role,
+        content: content
+      })
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => null);
+      throw new Error(`Failed to add message: ${response.status} - ${errorData?.error?.message || 'Unknown error'}`);
+    }
+
+    log('debug', `📨 ${role} message added to thread`);
+  } catch (error) {
+    log('error', '❌ Error adding message:', error);
+    throw error;
+  }
+}
 
 // ===============================================
 // ENVIO WHATSAPP
