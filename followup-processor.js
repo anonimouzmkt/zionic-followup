@@ -36,32 +36,106 @@ function logFollowUp(level, message, data = {}) {
 // ===============================================
 
 /**
- * Busca follow-ups prontos para execução
+ * Busca follow-ups prontos para execução (com filtros de agente e pausa)
  */
 async function getPendingFollowUps(supabase, config) {
   try {
     logFollowUp('info', 'Buscando follow-ups pendentes...');
     
-    const { data: followUps, error } = await supabase.rpc('get_pending_follow_ups_optimized', {
-      p_limit: config.maxFollowUpsPerExecution
-    });
+    // ✅ NOVA CONSULTA: Buscar follow-ups com verificação de agente e status
+    const { data: followUps, error } = await supabase
+      .from('follow_up_queue')
+      .select(`
+        id,
+        conversation_id,
+        contact_id,
+        agent_id,
+        company_id,
+        rule_name,
+        message_template,
+        scheduled_at,
+        attempts,
+        max_attempts,
+        status,
+        metadata,
+        contact_name,
+        contact_phone,
+        conversations!inner(
+          ai_agent_id,
+          ai_enabled,
+          assigned_to,
+          metadata
+        )
+      `)
+      .eq('status', 'pending')
+      .lte('scheduled_at', new Date().toISOString())
+      .not('conversations.ai_agent_id', 'is', null) // ✅ Só conversas com agente atribuído
+      .neq('conversations.ai_enabled', false) // ✅ Só conversas com agente ativo
+      .order('scheduled_at', { ascending: true })
+      .limit(config.maxFollowUpsPerExecution);
     
     if (error) {
       logFollowUp('error', 'Erro ao buscar follow-ups pendentes', { error: error.message });
       return [];
     }
     
-    const totalPending = followUps?.length || 0;
-    const overdueCount = followUps?.filter(f => f.minutes_overdue > 0).length || 0;
+    // ✅ FILTRO ADICIONAL: Remover conversas com follow-ups pausados
+    const validFollowUps = (followUps || []).filter(followUp => {
+      const conversation = followUp.conversations;
+      
+      // Verificar se follow-ups estão pausados na metadata
+      if (conversation?.metadata?.follow_up_paused === true) {
+        logFollowUp('debug', 'Follow-up filtrado - follow-ups pausados', {
+          followUpId: followUp.id,
+          conversationId: followUp.conversation_id,
+          reason: 'follow_ups_paused_in_metadata'
+        });
+        return false;
+      }
+      
+      // Verificar se conversa está atribuída a humano
+      if (conversation?.assigned_to && conversation?.ai_enabled === false) {
+        logFollowUp('debug', 'Follow-up filtrado - conversa atribuída a humano', {
+          followUpId: followUp.id,
+          conversationId: followUp.conversation_id,
+          assignedTo: conversation.assigned_to,
+          reason: 'assigned_to_human'
+        });
+        return false;
+      }
+      
+      return true;
+    });
     
-    logFollowUp('success', `${totalPending} follow-ups prontos para execução`, {
+    // ✅ OTIMIZAÇÃO: Calcular minutos de atraso para cada follow-up
+    const enrichedFollowUps = validFollowUps.map(followUp => {
+      const scheduledTime = new Date(followUp.scheduled_at).getTime();
+      const currentTime = Date.now();
+      const minutesOverdue = Math.max(0, Math.floor((currentTime - scheduledTime) / (1000 * 60)));
+      
+      return {
+        ...followUp,
+        minutes_overdue: minutesOverdue
+      };
+    });
+    
+    const totalPending = enrichedFollowUps.length;
+    const overdueCount = enrichedFollowUps.filter(f => f.minutes_overdue > 0).length;
+    const filteredOut = (followUps?.length || 0) - totalPending;
+    
+    logFollowUp('success', `${totalPending} follow-ups válidos prontos para execução`, {
       total: totalPending,
       overdue: overdueCount,
       onTime: totalPending - overdueCount,
-      method: 'sql_optimized'
+      filteredOut: filteredOut,
+      method: 'enhanced_filtering'
     });
     
-    return followUps || [];
+    if (filteredOut > 0) {
+      logFollowUp('info', `${filteredOut} follow-ups filtrados por regras de agente/pausa`);
+    }
+    
+    return enrichedFollowUps;
     
   } catch (error) {
     logFollowUp('error', 'Erro ao buscar follow-ups', { error: error.message });
@@ -192,22 +266,25 @@ async function processFollowUp(supabase, config, followUp, generatePersonalizedM
       return { success: true, skipped: true, reason: 'status_changed' };
     }
     
-    // ✅ Verificar se conversa está com follow-ups pausados
-    const { data: conversation, error: convPauseError } = await supabase
+    // ✅ NOVO: Verificar se conversa tem agente atribuído e se está pausado (igual whatsapp-webhook)
+    const { data: conversation, error: convError } = await supabase
       .from('conversations')
-      .select('metadata')
+      .select('ai_agent_id, ai_enabled, metadata, assigned_to')
       .eq('id', followUp.conversation_id)
       .single();
     
-    if (!convPauseError && conversation?.metadata?.follow_up_paused === true) {
-      logFollowUp('warning', 'Follow-up cancelado - conversa pausada pelo usuário', { 
+    if (convError) {
+      throw new Error(`Erro ao buscar dados da conversa: ${convError.message}`);
+    }
+
+    // ✅ 1. Verificar se conversa tem agente IA atribuído
+    if (!conversation.ai_agent_id) {
+      logFollowUp('warning', 'Follow-up cancelado - conversa não tem agente IA atribuído', { 
         followUpId: followUp.id,
         ruleName: followUp.rule_name,
         contactName: followUp.contact_name,
         conversationId: followUp.conversation_id,
-        pausedAt: conversation.metadata.follow_up_paused_at,
-        pausedBy: conversation.metadata.follow_up_paused_by,
-        reason: 'conversation_follow_ups_paused'
+        reason: 'no_agent_assigned'
       });
       
       // Marcar follow-up como cancelado
@@ -215,17 +292,105 @@ async function processFollowUp(supabase, config, followUp, generatePersonalizedM
         .from('follow_up_queue')
         .update({ 
           status: 'cancelled',
-          execution_error: 'Conversa com follow-ups pausados manualmente',
+          execution_error: 'Conversa não possui agente IA atribuído',
           metadata: {
             ...followUp.metadata,
-            cancelled_reason: 'conversation_paused',
-            cancelled_at: new Date().toISOString(),
-            paused_by_user: conversation.metadata.follow_up_paused_by
+            cancelled_reason: 'no_agent_assigned',
+            cancelled_at: new Date().toISOString()
           }
         })
         .eq('id', followUp.id);
         
-      return { success: true, skipped: true, reason: 'conversation_paused' };
+      return { success: true, skipped: true, reason: 'no_agent_assigned' };
+    }
+
+    // ✅ 2. Verificar se agente IA está pausado (ai_enabled = false)
+    if (conversation.ai_enabled === false) {
+      logFollowUp('warning', 'Follow-up cancelado - agente IA está pausado', { 
+        followUpId: followUp.id,
+        ruleName: followUp.rule_name,
+        contactName: followUp.contact_name,
+        conversationId: followUp.conversation_id,
+        agentId: conversation.ai_agent_id,
+        reason: 'agent_paused'
+      });
+      
+      // Marcar follow-up como cancelado
+      await supabase
+        .from('follow_up_queue')
+        .update({ 
+          status: 'cancelled',
+          execution_error: 'Agente IA está pausado para esta conversa',
+          metadata: {
+            ...followUp.metadata,
+            cancelled_reason: 'agent_paused',
+            cancelled_at: new Date().toISOString(),
+            agent_id: conversation.ai_agent_id
+          }
+        })
+        .eq('id', followUp.id);
+        
+      return { success: true, skipped: true, reason: 'agent_paused' };
+    }
+
+    // ✅ 3. Verificar se conversa foi atribuída a humano (igual whatsapp-webhook)
+    if (conversation.assigned_to && conversation.ai_enabled === false) {
+      logFollowUp('warning', 'Follow-up cancelado - conversa atribuída a agente humano', { 
+        followUpId: followUp.id,
+        ruleName: followUp.rule_name,
+        contactName: followUp.contact_name,
+        conversationId: followUp.conversation_id,
+        assignedTo: conversation.assigned_to,
+        reason: 'assigned_to_human'
+      });
+      
+      // Marcar follow-up como cancelado
+      await supabase
+        .from('follow_up_queue')
+        .update({ 
+          status: 'cancelled',
+          execution_error: 'Conversa atribuída a agente humano',
+          metadata: {
+            ...followUp.metadata,
+            cancelled_reason: 'assigned_to_human',
+            cancelled_at: new Date().toISOString(),
+            assigned_to: conversation.assigned_to
+          }
+        })
+        .eq('id', followUp.id);
+        
+      return { success: true, skipped: true, reason: 'assigned_to_human' };
+    }
+
+    // ✅ 4. Verificar se follow-ups estão pausados para esta conversa (ChatSidebar)
+    if (conversation.metadata?.follow_up_paused === true) {
+      logFollowUp('warning', 'Follow-up cancelado - follow-ups pausados para esta conversa', { 
+        followUpId: followUp.id,
+        ruleName: followUp.rule_name,
+        contactName: followUp.contact_name,
+        conversationId: followUp.conversation_id,
+        pausedAt: conversation.metadata.follow_up_paused_at,
+        pausedBy: conversation.metadata.follow_up_paused_by,
+        reason: 'follow_ups_paused'
+      });
+      
+      // Marcar follow-up como cancelado
+      await supabase
+        .from('follow_up_queue')
+        .update({ 
+          status: 'cancelled',
+          execution_error: 'Follow-ups pausados manualmente para esta conversa',
+          metadata: {
+            ...followUp.metadata,
+            cancelled_reason: 'follow_ups_paused',
+            cancelled_at: new Date().toISOString(),
+            paused_by_user: conversation.metadata.follow_up_paused_by,
+            paused_at: conversation.metadata.follow_up_paused_at
+          }
+        })
+        .eq('id', followUp.id);
+        
+      return { success: true, skipped: true, reason: 'follow_ups_paused' };
     }
     
     // ✅ Verificar se ainda pode tentar
@@ -254,6 +419,36 @@ async function processFollowUp(supabase, config, followUp, generatePersonalizedM
     const context = await getConversationContext(supabase, followUp.conversation_id);
     if (!context) {
       throw new Error('Não foi possível carregar contexto da conversa');
+    }
+
+    // ✅ NOVA VALIDAÇÃO: Verificar status do agente antes de prosseguir (igual whatsapp-webhook)
+    const agentValidation = await validateAgentConditions(supabase, context.conversation, followUp.agent_id);
+    if (!agentValidation.canRespond) {
+      logFollowUp('warning', 'Follow-up cancelado - agente não pode responder', {
+        followUpId: followUp.id,
+        ruleName: followUp.rule_name,
+        contactName: followUp.contact_name,
+        conversationId: followUp.conversation_id,
+        agentId: followUp.agent_id,
+        reason: agentValidation.reason
+      });
+      
+      // Marcar follow-up como cancelado
+      await supabase
+        .from('follow_up_queue')
+        .update({ 
+          status: 'cancelled',
+          execution_error: `Agente não pode responder: ${agentValidation.reason}`,
+          metadata: {
+            ...followUp.metadata,
+            cancelled_reason: 'agent_validation_failed',
+            cancelled_at: new Date().toISOString(),
+            validation_error: agentValidation.reason
+          }
+        })
+        .eq('id', followUp.id);
+        
+      return { success: true, skipped: true, reason: agentValidation.reason };
     }
     
     logFollowUp('debug', 'Contexto carregado para follow-up', {
@@ -496,11 +691,83 @@ async function processFollowUp(supabase, config, followUp, generatePersonalizedM
 }
 
 // ===============================================
+// VALIDAÇÃO DE AGENTE (copiada do whatsapp-webhook)
+// ===============================================
+
+/**
+ * Valida se agente pode responder baseado nas condições (igual whatsapp-webhook)
+ */
+async function validateAgentConditions(supabase, conversation, agentId) {
+  try {
+    // 1. Buscar dados do agente
+    const { data: agent, error: agentError } = await supabase
+      .from('ai_agents')
+      .select('status, handoff_triggers')
+      .eq('id', agentId)
+      .single();
+
+    if (agentError || !agent) {
+      return {
+        canRespond: false,
+        reason: 'Agent not found'
+      };
+    }
+
+    // 2. Verificar se agente está ativo
+    if (agent.status !== 'active' && agent.status !== 'error') {
+      return {
+        canRespond: false,
+        reason: 'Agent is not active'
+      };
+    }
+
+    // 3. Verificar se conversa foi atribuída a humano
+    if (conversation.assigned_to && conversation.ai_enabled === false) {
+      return {
+        canRespond: false,
+        reason: 'Conversation assigned to human agent'
+      };
+    }
+
+    // 4. Verificar se agente IA foi pausado manualmente
+    if (conversation.ai_enabled === false) {
+      return {
+        canRespond: false,
+        reason: 'AI agent manually paused by user'
+      };
+    }
+
+    // 5. Verificar se follow-ups estão pausados
+    if (conversation.metadata?.follow_up_paused === true) {
+      return {
+        canRespond: false,
+        reason: 'Follow-ups paused for this conversation'
+      };
+    }
+
+    return {
+      canRespond: true
+    };
+  } catch (error) {
+    logFollowUp('error', 'Erro ao validar condições do agente', { 
+      error: error.message,
+      agentId,
+      conversationId: conversation.id 
+    });
+    return {
+      canRespond: false,
+      reason: 'Validation error'
+    };
+  }
+}
+
+// ===============================================
 // EXPORTAÇÕES
 // ===============================================
 
 module.exports = {
   getPendingFollowUps,
   processFollowUp,
-  logFollowUp
+  logFollowUp,
+  validateAgentConditions
 }; 
